@@ -1,10 +1,14 @@
 package com.kAIS.KAIMyEntity.renderer;
 
 import com.kAIS.KAIMyEntity.KAIMyEntityClient;
+import com.kAIS.KAIMyEntity.vrm.VrmLoader;
+import com.kAIS.KAIMyEntity.vrm.VrmLoader.VrmSkeleton;
+
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.util.Locale;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Properties;
@@ -26,7 +30,7 @@ public class MMDModelManager {
     }
 
     /**
-     * 모델 로딩 - URDF만 지원
+     * 모델 로딩 - URDF 우선, 있으면 VRM/GLB 스켈레톤 자동 프리뷰 연동
      */
     public static IMMDModel LoadModel(String modelName) {
         File modelDir = new File(gameDirectory + "/KAIMyEntity/" + modelName);
@@ -42,11 +46,34 @@ public class MMDModelManager {
         if (urdfFile.isFile()) {
             logger.info("Loading URDF: " + modelName);
             IMMDModel urdfModel = com.kAIS.KAIMyEntity.urdf.URDFModelOpenGLWithSTL.Create(
-                urdfFile.getAbsolutePath(), 
+                urdfFile.getAbsolutePath(),
                 modelDirStr
             );
+
             if (urdfModel != null) {
-                logger.info("✓ URDF loaded: " + modelName);
+                logger.info("✓ URDF loaded: {}", modelName);
+
+                // === VRM/GLB 스켈레톤 자동 로드(옵션) ===
+                try {
+                    File avatar = findAvatarFile(modelDir);
+                    if (avatar != null && avatar.isFile()) {
+                        logger.info("Found avatar candidate: {}", avatar.getAbsolutePath());
+                        VrmSkeleton skel = VrmLoader.load(avatar);
+                        if (skel != null) {
+                            urdfModel.setPreviewSkeleton(skel);   // IMMDModel 훅
+                            urdfModel.onMappingUpdated(null);      // 선택: 매핑 갱신 통지
+                            logger.info("✓ VRM skeleton loaded (profile={}, bones={})", skel.profile, skel.bones.size());
+                        } else {
+                            logger.warn("VRM/GLB skeleton load failed: {}", avatar.getName());
+                        }
+                    } else {
+                        logger.info("No VRM/GLB found next to model (optional).");
+                    }
+                } catch (Throwable t) {
+                    logger.warn("Avatar scan/load failed", t);
+                }
+                // ================================
+
                 return urdfModel;
             }
         }
@@ -61,7 +88,7 @@ public class MMDModelManager {
     public static Model GetModel(String modelName, String uuid) {
         String fullName = modelName + uuid;
         Model model = models.get(fullName);
-        
+
         if (model == null) {
             IMMDModel m = LoadModel(modelName);
             if (m == null) {
@@ -73,12 +100,12 @@ public class MMDModelManager {
             urdfData.entityName = fullName;
             urdfData.model = m;
             urdfData.modelName = modelName;
-            
+
             m.ResetPhysics();
-            
+
             models.put(fullName, urdfData);
-            logger.info("✓ Model registered: " + fullName);
-            
+            logger.info("✓ Model registered: {}", fullName);
+
             model = urdfData;
         }
         return model;
@@ -89,7 +116,7 @@ public class MMDModelManager {
     }
 
     public static void ReloadModel() {
-        models.clear();
+        if (models != null) models.clear();
     }
 
     // ========== 모델 클래스 ==========
@@ -112,16 +139,4 @@ public class MMDModelManager {
                 // properties 없어도 OK
             }
             isPropertiesLoaded = true;
- //           KAIMyEntityClient.reloadProperties = false;
-        }
-        
-        public boolean isURDFModel() { return true; }
-    }
-
-    /**
-     * URDF 모델
-     */
-    public static class URDFModelData extends Model {
-        // 기본 구현
-    }
-}
+            // KAIMyEntityClient.reloadP
