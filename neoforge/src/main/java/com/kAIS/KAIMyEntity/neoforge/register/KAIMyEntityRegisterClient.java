@@ -8,7 +8,6 @@ import com.kAIS.KAIMyEntity.neoforge.ClientTickLoop;
 import com.kAIS.KAIMyEntity.urdf.URDFModelOpenGLWithSTL;
 import com.kAIS.KAIMyEntity.urdf.control.MotionEditorScreen;
 import com.kAIS.KAIMyEntity.urdf.control.URDFMotionEditor;
-import com.kAIS.KAIMyEntity.urdf.control.URDFMappingScreen;
 
 import com.mojang.blaze3d.platform.InputConstants;
 import net.minecraft.client.Minecraft;
@@ -40,7 +39,7 @@ import java.util.Objects;
  * - G: 조인트 에디터 열기 (없으면 자동 로드 시도)
  * - Ctrl+G: URDF 리로드 + 자동 로드 시도
  * - H: 물리 리셋
- * - K: VMC 매핑 에디터 열기 (블렌더식 3D 뷰포트)
+ * - K: VMC 매핑 에디터 열기
  */
 @EventBusSubscriber(value = Dist.CLIENT)
 public class KAIMyEntityRegisterClient {
@@ -102,20 +101,18 @@ public class KAIMyEntityRegisterClient {
                 // G → 조인트 에디터 열기
                 if (ClientTickLoop.renderer == null) ensureActiveRenderer(MC);
                 if (ClientTickLoop.renderer != null) {
-                    MC.setScreen(new MotionEditorScreen(MC.screen, ClientTickLoop.renderer));
+                    MC.setScreen(new MotionEditorScreen(ClientTickLoop.renderer));
                 } else {
                     MC.gui.getChat().addMessage(Component.literal("[URDF] No active renderer. Put a *.urdf under ./KAIMyEntity or ./config and press G again."));
                 }
             }
         }
 
-        // ==== K: VMC 매핑 에디터 열기 (블렌더식 3D 뷰포트) ====
+        // ==== K: VMC 매핑 에디터 열기 ====
         if (keyOpenVmcMapping.consumeClick()) {
             if (ClientTickLoop.renderer == null) ensureActiveRenderer(MC);
             if (ClientTickLoop.renderer != null) {
-                URDFModelOpenGLWithSTL r = ClientTickLoop.renderer;
-                URDFMotionEditor me = r.getMotionEditor();
-                MC.setScreen(new URDFMappingScreen(MC.screen, r, me));
+                MC.setScreen(new URDFMotionEditor(MC.screen, ClientTickLoop.renderer));
             } else {
                 MC.gui.getChat().addMessage(Component.literal("[URDF] No active renderer. Put a *.urdf under ./KAIMyEntity or ./config and press K again."));
             }
