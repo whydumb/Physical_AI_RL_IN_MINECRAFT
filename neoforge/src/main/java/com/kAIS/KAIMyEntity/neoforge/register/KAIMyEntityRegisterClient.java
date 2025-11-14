@@ -65,6 +65,9 @@ public class KAIMyEntityRegisterClient {
         e.register(keyOpenVmcMapping);
         e.register(keyResetPhysics);
         logger.info("KAIMyEntityRegisterClient: key mappings registered.");
+        
+        // ★ 틱 리스너 등록 (한 번만 호출됨)
+        ClientTickLoop.register();
     }
 
     // === 하위호환용 Register() (초기화 호출 호환) ===
