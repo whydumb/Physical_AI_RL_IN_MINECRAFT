@@ -65,9 +65,6 @@ public class KAIMyEntityRegisterClient {
         e.register(keyOpenVmcMapping);
         e.register(keyResetPhysics);
         logger.info("KAIMyEntityRegisterClient: key mappings registered.");
-
-        // ★ 틱 리스너 등록 (한 번만 호출됨)
-        ClientTickLoop.register();
     }
 
     // === 하위호환용 Register() (초기화 호출 호환) ===
@@ -89,7 +86,7 @@ public class KAIMyEntityRegisterClient {
         if (keyMotionGuiOrReload.consumeClick()) {
             long win = MC.getWindow().getWindow();
             boolean ctrl = org.lwjgl.glfw.GLFW.glfwGetKey(win, GLFW.GLFW_KEY_LEFT_CONTROL)  == GLFW.GLFW_PRESS
-                    || org.lwjgl.glfw.GLFW.glfwGetKey(win, GLFW.GLFW_KEY_RIGHT_CONTROL) == GLFW.GLFW_PRESS;
+                        || org.lwjgl.glfw.GLFW.glfwGetKey(win, GLFW.GLFW_KEY_RIGHT_CONTROL) == GLFW.GLFW_PRESS;
 
             if (ctrl) {
                 // Ctrl+G → 리로드
