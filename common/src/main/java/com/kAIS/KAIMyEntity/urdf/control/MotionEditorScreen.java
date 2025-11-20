@@ -11,9 +11,9 @@ import static java.lang.Math.*;
 
 /**
  * 2025.11.20 VMC Direct Retargeting (IK 제거, 순수 데이터 기반)
- * - /VMC/Ext/Bone/Pos/Local의 로컬 회전을 직접 사용
+ * - /VMC/Ext/Bone/Pos/Local의 로컬 회전과 위치를 사용
  * - IK 계산 완전 제거
- * - 팔만 움직임 (다리 필요 없음)
+ * - 위치 벡터 기반 관절 각도 계산
  */
 public final class MotionEditorScreen {
     private MotionEditorScreen() {}
@@ -99,6 +99,9 @@ final class URDFArmRetargeter {
     public static final String R_SHO_ROLL  = "r_sho_roll";
     public static final String R_ELBOW     = "r_el";
 
+    private static final float ELBOW_SIGN_LEFT = -1f;
+    private static final float ELBOW_SIGN_RIGHT = +1f;
+
     public Map<String, Float> commands(Map<String, Object> bones) {
         Map<String, Float> out = new HashMap<>();
         solve(bones, true, out);   // 왼팔
@@ -110,47 +113,48 @@ final class URDFArmRetargeter {
         // VMC 본 데이터 읽기
         var upper = readBone(b.get(left ? "LeftUpperArm" : "RightUpperArm"));
         var lower = readBone(b.get(left ? "LeftLowerArm" : "RightLowerArm"));
+        var hand  = readBone(b.get(left ? "LeftHand"     : "RightHand"));
         
-        if (upper == null || lower == null) return;
+        if (upper == null || lower == null || hand == null) return;
 
-        // 로컬 회전에서 오일러 각도 추출
-        Vector3f upperEuler = toEulerZYX(upper.rotation);
-        Vector3f lowerEuler = toEulerZYX(lower.rotation);
+        // 🔑 핵심: 위치 벡터로 관절 각도 계산
+        Vector3f sh = upper.position;
+        Vector3f el = lower.position;
+        Vector3f wr = hand.position;
 
-        // URDF 조인트로 매핑 (좌표계 변환 포함)
-        // VMC Unity 좌표계 -> URDF ROS 좌표계 변환
-        float shoPitch = -upperEuler.y;  // Y축 회전 -> Pitch
-        float shoRoll  = upperEuler.x;   // X축 회전 -> Roll
-        float elbow    = -lowerEuler.y * (left ? 1f : -1f);  // 팔꿈치 굽힘
+        // 어깨->팔꿈치, 팔꿈치->손목 방향 벡터
+        Vector3f upperVec = new Vector3f(el).sub(sh).normalize();
+        Vector3f lowerVec = new Vector3f(wr).sub(el).normalize();
+
+        // 부모 본 회전 기준으로 로컬 벡터 계산
+        Vector3f localUpper = toLocal(upperVec, upper.rotation);
+
+        // Pitch & Roll 계산
+        float pitch = (float) atan2(localUpper.z, hypot(localUpper.x, localUpper.y));
+        float roll  = (float) atan2(localUpper.y, localUpper.x);
+
+        // 팔꿈치 각도 계산
+        float rawElbow = (float) acos(max(-1f, min(1f, upperVec.dot(lowerVec))));
+        float elbow = rawElbow * (left ? ELBOW_SIGN_LEFT : ELBOW_SIGN_RIGHT);
 
         if (left) {
-            out.put(L_SHO_PITCH, shoPitch);
-            out.put(L_SHO_ROLL,  shoRoll);
+            out.put(L_SHO_PITCH, pitch);
+            out.put(L_SHO_ROLL,  roll);
             out.put(L_ELBOW,     elbow);
         } else {
-            out.put(R_SHO_PITCH, shoPitch);
-            out.put(R_SHO_ROLL,  shoRoll);
+            out.put(R_SHO_PITCH, pitch);
+            out.put(R_SHO_ROLL,  roll);
             out.put(R_ELBOW,     elbow);
         }
     }
 
     /**
-     * Quaternion -> Euler (ZYX 순서)
+     * 월드 벡터를 부모 본의 로컬 좌표계로 변환
      */
-    private Vector3f toEulerZYX(Quaternionf q) {
-        // ZYX Euler: Roll(X) -> Pitch(Y) -> Yaw(Z)
-        float sinr_cosp = 2 * (q.w * q.x + q.y * q.z);
-        float cosr_cosp = 1 - 2 * (q.x * q.x + q.y * q.y);
-        float roll = (float) atan2(sinr_cosp, cosr_cosp);
-
-        float sinp = 2 * (q.w * q.y - q.z * q.x);
-        float pitch = (float) (abs(sinp) >= 1 ? copySign(PI / 2, sinp) : asin(sinp));
-
-        float siny_cosp = 2 * (q.w * q.z + q.x * q.y);
-        float cosy_cosp = 1 - 2 * (q.y * q.y + q.z * q.z);
-        float yaw = (float) atan2(siny_cosp, cosy_cosp);
-
-        return new Vector3f(roll, pitch, yaw);
+    private Vector3f toLocal(Vector3f worldVec, Quaternionf parentRot) {
+        // 부모 회전의 역변환 적용
+        Matrix3f invRotMat = new Matrix3f().rotation(parentRot).transpose();
+        return new Vector3f(worldVec).mul(invRotMat);
     }
 
     private VMCListenerController.VmcListener.BoneTransform readBone(Object t) {
@@ -203,7 +207,9 @@ final class JointControlBus {
             if (target == null) continue;
 
             // 관절 제한 적용
-            float lo = Float.NEGATIVE_INFINITY, hi = Float.POSITIVE_INFINITY;
+            float lo = Float.NEGATIVE_INFINITY;
+            float hi = Float.POSITIVE_INFINITY;
+            
             if (n.equals("l_sho_pitch") || n.equals("r_sho_pitch")) { 
                 lo = (float) toRadians(-250); 
                 hi = (float) toRadians(250); 
