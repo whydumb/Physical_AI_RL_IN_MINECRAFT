@@ -8,7 +8,8 @@ import com.kAIS.KAIMyEntity.neoforge.ClientTickLoop;
 import com.kAIS.KAIMyEntity.urdf.URDFModelOpenGLWithSTL;
 import com.kAIS.KAIMyEntity.urdf.control.MotionEditorScreen;
 import com.kAIS.KAIMyEntity.urdf.control.VMCListenerController;
-import com.kAIS.KAIMyEntity.webots.WebotsController; // ✅ 추가
+import com.kAIS.KAIMyEntity.webots.WebotsController;
+import com.kAIS.KAIMyEntity.webots.WebotsConfigScreen; // ✅ 추가
 
 import com.mojang.blaze3d.platform.InputConstants;
 import net.minecraft.client.Minecraft;
@@ -41,8 +42,9 @@ import java.util.Objects;
  * - Ctrl+G: URDF 리로드 + 자동 로드 시도
  * - H: 물리 리셋
  * - K: VMC 매핑 에디터 열기
- * - T: Webots 통계 출력 (디버깅용) ✅ 추가
- * - Y: Webots T-Pose 테스트 ✅ 추가
+ * - T: Webots 통계 출력 (디버깅용)
+ * - Y: Webots T-Pose 테스트
+ * - U: Webots 설정 GUI ✅ 추가
  */
 @EventBusSubscriber(value = Dist.CLIENT)
 public class KAIMyEntityRegisterClient {
@@ -56,8 +58,9 @@ public class KAIMyEntityRegisterClient {
     static KeyMapping keyMotionGuiOrReload = new KeyMapping("key.motionGuiOrReload", KeyConflictContext.IN_GAME, KeyModifier.NONE, InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_G, "key.title");
     static KeyMapping keyOpenVmcMapping    = new KeyMapping("key.openVmcMapping",  KeyConflictContext.IN_GAME, KeyModifier.NONE, InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_K, "key.title");
     static KeyMapping keyResetPhysics      = new KeyMapping("key.resetPhysics",    KeyConflictContext.IN_GAME, KeyModifier.NONE, InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_H, "key.title");
-    static KeyMapping keyWebotsStats       = new KeyMapping("key.webotsStats",     KeyConflictContext.IN_GAME, KeyModifier.NONE, InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_T, "key.title"); // ✅ 추가
-    static KeyMapping keyWebotsTest        = new KeyMapping("key.webotsTest",      KeyConflictContext.IN_GAME, KeyModifier.NONE, InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_Y, "key.title"); // ✅ 추가
+    static KeyMapping keyWebotsStats       = new KeyMapping("key.webotsStats",     KeyConflictContext.IN_GAME, KeyModifier.NONE, InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_T, "key.title");
+    static KeyMapping keyWebotsTest        = new KeyMapping("key.webotsTest",      KeyConflictContext.IN_GAME, KeyModifier.NONE, InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_Y, "key.title");
+    static KeyMapping keyWebotsConfig      = new KeyMapping("key.webotsConfig",    KeyConflictContext.IN_GAME, KeyModifier.NONE, InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_U, "key.title"); // ✅ 추가
 
     // === 키 등록 ===
     @SubscribeEvent
@@ -69,8 +72,9 @@ public class KAIMyEntityRegisterClient {
         e.register(keyMotionGuiOrReload);
         e.register(keyOpenVmcMapping);
         e.register(keyResetPhysics);
-        e.register(keyWebotsStats);  // ✅ 추가
-        e.register(keyWebotsTest);   // ✅ 추가
+        e.register(keyWebotsStats);
+        e.register(keyWebotsTest);
+        e.register(keyWebotsConfig);  // ✅ 추가
         logger.info("KAIMyEntityRegisterClient: key mappings registered.");
     }
 
@@ -136,7 +140,7 @@ public class KAIMyEntityRegisterClient {
             }
         }
 
-        // ✅ ==== T: Webots 통계 출력 ====
+        // ==== T: Webots 통계 출력 ====
         if (keyWebotsStats.consumeClick()) {
             try {
                 WebotsController.getInstance().printStats();
@@ -146,9 +150,14 @@ public class KAIMyEntityRegisterClient {
             }
         }
 
-        // ✅ ==== Y: Webots 테스트 자세 ====
+        // ==== Y: Webots 테스트 자세 ====
         if (keyWebotsTest.consumeClick()) {
             testWebotsConnection(MC);
+        }
+
+        // ✅ ==== U: Webots 설정 GUI ====
+        if (keyWebotsConfig.consumeClick()) {
+            MC.setScreen(new WebotsConfigScreen(MC.screen));
         }
     }
 
@@ -168,7 +177,7 @@ public class KAIMyEntityRegisterClient {
                 new com.kAIS.KAIMyEntity.neoforge.network.KAIMyEntityNetworkPack(1, player.getGameProfile(), index));
     }
 
-    // ✅ === Webots 연결 테스트 (T-Pose) ===
+    // === Webots 연결 테스트 (T-Pose) ===
     private static void testWebotsConnection(Minecraft mc) {
         try {
             var webots = WebotsController.getInstance();
