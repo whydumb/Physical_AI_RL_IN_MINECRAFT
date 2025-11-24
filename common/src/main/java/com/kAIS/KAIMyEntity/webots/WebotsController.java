@@ -1,6 +1,8 @@
 // common/src/main/java/com/kAIS/KAIMyEntity/webots/WebotsController.java
 package com.kAIS.KAIMyEntity.webots;
 
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.player.LocalPlayer;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -13,79 +15,103 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.*;
 
+/**
+ * 통합 Webots/RobotListener 컨트롤러
+ * 
+ * 기능:
+ * 1. Webots 연동 (URDF → Webots HTTP API)
+ * 2. RobotListener 연동 (Minecraft WASD + 마우스 → RobotListener)
+ * 
+ * 두 가지 모드:
+ * - WEBOTS 모드: set_joint API 사용 (URDF 관절 제어)
+ * - ROBOTLISTENER 모드: set_walk + set_head API 사용 (실시간 제어)
+ */
 public class WebotsController {
     private static final Logger LOGGER = LogManager.getLogger();
     private static WebotsController instance;
 
+    // ==================== 모드 설정 ====================
+    public enum Mode {
+        WEBOTS,          // Webots 직접 제어 (set_joint)
+        ROBOTLISTENER    // RobotListener를 통한 제어 (set_walk + set_head)
+    }
+    
+    private Mode currentMode = Mode.WEBOTS;
+
+    // ==================== 네트워크 ====================
     private final HttpClient httpClient;
-    private String webotsUrl;
-    private String robotIp;
-    private int robotPort;
+    private String serverIp;
+    private int serverPort;
+    private String serverUrl;
+    
     private final ExecutorService executor;
     private final ScheduledExecutorService scheduler;
     private final BlockingQueue<Command> commandQueue;
-    private final Map<String, Float> lastSent;
-    private static final float DELTA_THRESHOLD = 0.01f;
-
+    
     private volatile boolean connected = false;
     private volatile int failureCount = 0;
     private static final int MAX_FAILURES = 10;
 
-    private final Stats stats = new Stats();
-
-    // ==================== 최종 정답 JOINT_MAP (2025-11-21 기준) ====================
+    // ==================== Webots 관련 ====================
+    private final Map<String, Float> lastSentJoint;
+    private static final float JOINT_DELTA_THRESHOLD = 0.01f;
+    
+    // 조인트 매핑 (URDF → Webots)
     private static final Map<String, JointMapping> JOINT_MAP = new HashMap<>();
-
+    
     static {
         // 머리
         JOINT_MAP.put("head_pan",  new JointMapping("Neck",  18, -1.57f,  1.57f));
         JOINT_MAP.put("head_tilt", new JointMapping("Head",  19, -0.52f,  0.52f));
-
-        // 오른쪽 팔
+        
+        // 오른팔
         JOINT_MAP.put("r_sho_pitch", new JointMapping("ShoulderR", 0, -1.57f,  0.52f));
         JOINT_MAP.put("r_sho_roll",  new JointMapping("ArmUpperR", 2, -0.68f,  2.30f));
         JOINT_MAP.put("r_el",        new JointMapping("ArmLowerR", 4, -1.57f, -0.10f));
-
-        // 왼쪽 팔
+        
+        // 왼팔
         JOINT_MAP.put("l_sho_pitch", new JointMapping("ShoulderL", 1, -1.57f,  0.52f));
         JOINT_MAP.put("l_sho_roll",  new JointMapping("ArmUpperL", 3, -2.25f,  0.77f));
         JOINT_MAP.put("l_el",        new JointMapping("ArmLowerL", 5, -1.57f, -0.10f));
-
-        // 골반
-        JOINT_MAP.put("r_hip_yaw",   new JointMapping("PelvYR", 6, -1.047f, 1.047f));
-        JOINT_MAP.put("l_hip_yaw",   new JointMapping("PelvYL", 7, -0.69f,  2.50f));
-        JOINT_MAP.put("r_hip_roll",  new JointMapping("PelvR",  8, -1.01f,  1.01f));
-        JOINT_MAP.put("l_hip_roll",  new JointMapping("PelvL",  9, -0.35f,  0.35f));
-
-        // 다리
-        JOINT_MAP.put("r_hip_pitch", new JointMapping("LegUpperR", 10, -2.50f, 0.87f));
-        JOINT_MAP.put("l_hip_pitch", new JointMapping("LegUpperL", 11, -2.50f, 0.87f));
-        JOINT_MAP.put("r_hip_roll",  new JointMapping("LegLowerR", 12, -0.35f, 0.35f));
-        JOINT_MAP.put("l_hip_roll",  new JointMapping("LegLowerL", 13, -0.35f, 0.35f));
-
-        JOINT_MAP.put("r_knee", new JointMapping("KneeR", 14, -0.1f, 2.09f));
-        JOINT_MAP.put("l_knee", new JointMapping("KneeL", 15, -0.1f, 2.09f));
-
-        JOINT_MAP.put("r_ank_pitch", new JointMapping("AnkleR", 14, -0.87f, 0.87f));
-        JOINT_MAP.put("l_ank_pitch", new JointMapping("AnkleL", 15, -1.39f, 1.22f));
-        JOINT_MAP.put("r_ank_roll",  new JointMapping("FootR",  16, -0.87f, 0.87f));
-        JOINT_MAP.put("l_ank_roll",  new JointMapping("FootL",  17, -0.87f, 0.87f));
-
-        // 역호환용 Webots 이름
+        
+        // 역호환 (Webots 이름으로도 접근 가능)
+        JOINT_MAP.put("Neck", new JointMapping("Neck", 18, -1.57f, 1.57f));
+        JOINT_MAP.put("Head", new JointMapping("Head", 19, -0.52f, 0.52f));
         JOINT_MAP.put("ShoulderR", new JointMapping("ShoulderR", 0, -1.57f, 0.52f));
         JOINT_MAP.put("ShoulderL", new JointMapping("ShoulderL", 1, -1.57f, 0.52f));
         JOINT_MAP.put("ArmUpperR", new JointMapping("ArmUpperR", 2, -0.68f, 2.30f));
         JOINT_MAP.put("ArmUpperL", new JointMapping("ArmUpperL", 3, -2.25f, 0.77f));
         JOINT_MAP.put("ArmLowerR", new JointMapping("ArmLowerR", 4, -1.57f, -0.10f));
         JOINT_MAP.put("ArmLowerL", new JointMapping("ArmLowerL", 5, -1.57f, -0.10f));
-        JOINT_MAP.put("Neck",      new JointMapping("Neck",      18, -1.57f, 1.57f));
-        JOINT_MAP.put("Head",      new JointMapping("Head",      19, -0.52f, 0.52f));
     }
 
+    // ==================== RobotListener 관련 ====================
+    private boolean robotListenerEnabled = false;
+    
+    // WASD 이전 상태 (델타 감지)
+    private boolean lastF = false, lastB = false, lastL = false, lastR = false;
+    private float lastYaw = 0.0f;
+    private float lastPitch = 0.0f;
+    
+    // 민감도
+    private static final float YAW_SENSITIVITY = 0.01f;    // 0.57도
+    private static final float PITCH_SENSITIVITY = 0.01f;
+    
+    // 모터 범위
+    private static final float NECK_MIN = -1.57f;
+    private static final float NECK_MAX = 1.57f;
+    private static final float HEAD_MIN = -0.52f;
+    private static final float HEAD_MAX = 0.52f;
+
+    // ==================== 통계 ====================
+    private final Stats stats = new Stats();
+
+    // ==================== 생성자 ====================
+    
     private WebotsController(String ip, int port) {
-        this.robotIp = ip;
-        this.robotPort = port;
-        this.webotsUrl = String.format("http://%s:%d", ip, port);
+        this.serverIp = ip;
+        this.serverPort = port;
+        this.serverUrl = String.format("http://%s:%d", ip, port);
 
         this.httpClient = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofMillis(500))
@@ -104,25 +130,20 @@ public class WebotsController {
         });
 
         this.commandQueue = new LinkedBlockingQueue<>();
-        this.lastSent = new ConcurrentHashMap<>();
+        this.lastSentJoint = new ConcurrentHashMap<>();
 
         scheduler.scheduleAtFixedRate(this::processQueue, 0, 20, TimeUnit.MILLISECONDS);
         testConnection();
 
-        LOGGER.info("✅ WebotsController initialized: {}", webotsUrl);
+        LOGGER.info("✅ WebotsController initialized: {}", serverUrl);
     }
 
-    /**
-     * ✅ 개선: WebotsConfigScreen.Config에서 기본값 로드
-     */
     public static WebotsController getInstance() {
         if (instance == null) {
-            // WebotsConfigScreen.Config에서 마지막 저장된 IP/Port 가져오기
             try {
                 WebotsConfigScreen.Config config = WebotsConfigScreen.Config.getInstance();
                 instance = new WebotsController(config.getLastIp(), config.getLastPort());
             } catch (Exception e) {
-                // Config 로드 실패 시 기본값 사용
                 LOGGER.warn("Failed to load config, using defaults", e);
                 instance = new WebotsController("localhost", 8080);
             }
@@ -130,17 +151,13 @@ public class WebotsController {
         return instance;
     }
 
-    /**
-     * ✅ 개선: Config 저장 포함
-     */
     public static WebotsController getInstance(String ip, int port) {
         if (instance != null) {
-            if (!instance.robotIp.equals(ip) || instance.robotPort != port) {
-                LOGGER.info("🔄 Recreating WebotsController with new address: {}:{}", ip, port);
+            if (!instance.serverIp.equals(ip) || instance.serverPort != port) {
+                LOGGER.info("🔄 Recreating WebotsController: {}:{}", ip, port);
                 instance.shutdown();
                 instance = new WebotsController(ip, port);
                 
-                // ✅ Config에 저장
                 try {
                     WebotsConfigScreen.Config config = WebotsConfigScreen.Config.getInstance();
                     config.update(ip, port);
@@ -151,7 +168,6 @@ public class WebotsController {
         } else {
             instance = new WebotsController(ip, port);
             
-            // ✅ Config에 저장
             try {
                 WebotsConfigScreen.Config config = WebotsConfigScreen.Config.getInstance();
                 config.update(ip, port);
@@ -162,60 +178,25 @@ public class WebotsController {
         return instance;
     }
 
+    // ==================== 모드 전환 ====================
+    
+    public void setMode(Mode mode) {
+        this.currentMode = mode;
+        LOGGER.info("Mode changed to: {}", mode);
+    }
+    
+    public Mode getMode() {
+        return currentMode;
+    }
+
+    // ==================== Webots 모드: 관절 제어 ====================
+    
     /**
-     * ✅ 개선: Config 저장 포함
+     * URDF 관절을 Webots로 전송 (Webots 모드)
      */
-    public void reconnect(String ip, int port) {
-        LOGGER.info("🔄 Reconnecting to {}:{}", ip, port);
-        this.robotIp = ip;
-        this.robotPort = port;
-        this.webotsUrl = String.format("http://%s:%d", ip, port);
-        this.failureCount = 0;
-        this.connected = false;
-
-        commandQueue.clear();
-        lastSent.clear();
-
-        testConnection();
-        
-        // ✅ Config에 저장
-        try {
-            WebotsConfigScreen.Config config = WebotsConfigScreen.Config.getInstance();
-            config.update(ip, port);
-        } catch (Exception e) {
-            LOGGER.warn("Failed to save config", e);
-        }
-    }
-
-    private void testConnection() {
-        executor.submit(() -> {
-            try {
-                String url = webotsUrl + "/?command=get_stats";
-                HttpRequest request = HttpRequest.newBuilder()
-                        .uri(URI.create(url))
-                        .timeout(Duration.ofMillis(500))
-                        .GET()
-                        .build();
-
-                HttpResponse<String> response = httpClient.send(request,
-                        HttpResponse.BodyHandlers.ofString());
-
-                if (response.statusCode() == 200) {
-                    connected = true;
-                    failureCount = 0;
-                    LOGGER.info("✅ Connected to Webots: {}", webotsUrl);
-                } else {
-                    LOGGER.warn("⚠️  Webots returned status {}", response.statusCode());
-                }
-
-            } catch (Exception e) {
-                connected = false;
-                LOGGER.error("❌ Failed to connect to Webots: {}", e.getMessage());
-            }
-        });
-    }
-
     public void setJoint(String jointName, float value) {
+        if (currentMode != Mode.WEBOTS) return;
+        
         JointMapping mapping = JOINT_MAP.get(jointName);
         if (mapping == null) {
             if (stats.unknownJointWarnings.computeIfAbsent(jointName, k -> 0) < 3) {
@@ -225,22 +206,18 @@ public class WebotsController {
             return;
         }
 
-        // URDF → Webots 변환 (부호 반전 + 범위 매핑)
         float webotsValue = convertUrdfToWebots(jointName, value);
-
-        Float last = lastSent.get(jointName);
-        if (last != null && Math.abs(webotsValue - last) < DELTA_THRESHOLD) {
+        Float last = lastSentJoint.get(jointName);
+        
+        if (last != null && Math.abs(webotsValue - last) < JOINT_DELTA_THRESHOLD) {
             stats.deltaSkipped++;
             return;
         }
 
         float clamped = clamp(webotsValue, mapping.min, mapping.max);
-        if (Math.abs(clamped - value) > 0.001f) {
-            stats.rangeClamped++;
-        }
-
-        if (commandQueue.offer(new Command(mapping.index, clamped))) {
-            lastSent.put(jointName, clamped);
+        
+        if (commandQueue.offer(new Command(CommandType.SET_JOINT, mapping.index, clamped))) {
+            lastSentJoint.put(jointName, clamped);
             stats.queued++;
         } else {
             stats.queueFull++;
@@ -251,21 +228,124 @@ public class WebotsController {
         joints.forEach(this::setJoint);
     }
 
+    // ==================== RobotListener 모드: 실시간 제어 ====================
+    
+    /**
+     * RobotListener 모드 활성화
+     */
+    public void enableRobotListener(boolean enable) {
+        this.robotListenerEnabled = enable;
+        if (enable) {
+            setMode(Mode.ROBOTLISTENER);
+            LOGGER.info("🎮 RobotListener mode enabled");
+        } else {
+            setMode(Mode.WEBOTS);
+            // 긴급 정지
+            sendStopAll();
+            LOGGER.info("🛑 RobotListener mode disabled");
+        }
+    }
+    
+    /**
+     * 매 틱 호출 (RobotListener 모드)
+     */
+    public void tick() {
+        if (currentMode != Mode.ROBOTLISTENER || !robotListenerEnabled || !connected) {
+            return;
+        }
+        
+        Minecraft mc = Minecraft.getInstance();
+        LocalPlayer player = mc.player;
+        if (player == null) return;
+        
+        // WASD 키 상태
+        boolean f = mc.options.keyUp.isDown();
+        boolean b = mc.options.keyDown.isDown();
+        boolean l = mc.options.keyLeft.isDown();
+        boolean r = mc.options.keyRight.isDown();
+        
+        // 마우스 에임
+        float yaw = player.getYRot();
+        float pitch = player.getXRot();
+        
+        // WASD 변화 감지
+        if (f != lastF || b != lastB || l != lastL || r != lastR) {
+            sendWalkCommand(f, b, l, r);
+            lastF = f; lastB = b; lastL = l; lastR = r;
+        }
+        
+        // 마우스 에임 변화 감지
+        float yawDelta = Math.abs(yaw - lastYaw);
+        float pitchDelta = Math.abs(pitch - lastPitch);
+        
+        if (yawDelta > YAW_SENSITIVITY * 57.3f || pitchDelta > PITCH_SENSITIVITY * 57.3f) {
+            sendHeadCommand(yaw, pitch);
+            lastYaw = yaw;
+            lastPitch = pitch;
+        }
+    }
+    
+    /**
+     * WASD 명령 전송
+     */
+    private void sendWalkCommand(boolean f, boolean b, boolean l, boolean r) {
+        String url = String.format(
+            "%s/?command=set_walk&f=%d&b=%d&l=%d&r=%d",
+            serverUrl, f ? 1 : 0, b ? 1 : 0, l ? 1 : 0, r ? 1 : 0
+        );
+        
+        sendAsyncDirect(url).thenAccept(success -> {
+            if (success) stats.walkSent++;
+            else stats.failed++;
+        });
+    }
+    
+    /**
+     * 마우스 에임 명령 전송
+     */
+    private void sendHeadCommand(float yawDeg, float pitchDeg) {
+        float yawRad = (float) Math.toRadians(yawDeg);
+        float pitchRad = (float) Math.toRadians(-pitchDeg);
+        
+        yawRad = clamp(yawRad, NECK_MIN, NECK_MAX);
+        pitchRad = clamp(pitchRad, HEAD_MIN, HEAD_MAX);
+        
+        String url = String.format(
+            "%s/?command=set_head&yaw=%.3f&pitch=%.3f",
+            serverUrl, yawRad, pitchRad
+        );
+        
+        sendAsyncDirect(url).thenAccept(success -> {
+            if (success) stats.headSent++;
+            else stats.failed++;
+        });
+    }
+    
+    /**
+     * 긴급 정지
+     */
+    private void sendStopAll() {
+        String url = String.format("%s/?command=stop_all", serverUrl);
+        sendAsyncDirect(url);
+    }
+
+    // ==================== HTTP 통신 ====================
+    
     private void processQueue() {
         Command cmd = commandQueue.poll();
         if (cmd == null) return;
-
-        executor.submit(() -> sendToWebots(cmd.index, cmd.value));
+        
+        if (cmd.type == CommandType.SET_JOINT) {
+            executor.submit(() -> sendJointToWebots(cmd.motorIndex, cmd.value));
+        }
     }
 
-    private void sendToWebots(int index, float value) {
-        if (!connected && failureCount > MAX_FAILURES) {
-            return;
-        }
+    private void sendJointToWebots(int index, float value) {
+        if (!connected && failureCount > MAX_FAILURES) return;
 
         try {
             String url = String.format("%s/?command=set_joint&index=%d&value=%.4f",
-                                      webotsUrl, index, value);
+                                      serverUrl, index, value);
 
             HttpRequest request = HttpRequest.newBuilder()
                     .uri(URI.create(url))
@@ -281,11 +361,10 @@ public class WebotsController {
                 failureCount = 0;
                 if (!connected) {
                     connected = true;
-                    LOGGER.info("✅ Reconnected to Webots");
+                    LOGGER.info("✅ Reconnected to server");
                 }
             } else {
                 stats.failed++;
-                LOGGER.warn("⚠️  Webots returned status {}", response.statusCode());
             }
 
         } catch (Exception e) {
@@ -294,17 +373,108 @@ public class WebotsController {
 
             if (failureCount == MAX_FAILURES) {
                 connected = false;
-                LOGGER.error("❌ Connection lost to Webots after {} failures", MAX_FAILURES);
-            } else if (failureCount % 50 == 0) {
-                LOGGER.warn("⚠️  Failed to send to Webots ({} failures): {}",
-                           failureCount, e.getMessage());
+                LOGGER.error("❌ Connection lost after {} failures", MAX_FAILURES);
             }
+        }
+    }
+    
+    /**
+     * 직접 전송 (RobotListener 명령용)
+     */
+    private CompletableFuture<Boolean> sendAsyncDirect(String url) {
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(url))
+                .timeout(Duration.ofMillis(100))
+                .GET()
+                .build();
+        
+        return httpClient.sendAsync(request, HttpResponse.BodyHandlers.discarding())
+                .thenApply(response -> {
+                    boolean success = (response.statusCode() == 200);
+                    if (success) {
+                        connected = true;
+                        failureCount = 0;
+                    }
+                    return success;
+                })
+                .exceptionally(e -> {
+                    failureCount++;
+                    if (failureCount >= MAX_FAILURES) {
+                        connected = false;
+                    }
+                    return false;
+                });
+    }
+
+    private void testConnection() {
+        executor.submit(() -> {
+            try {
+                String url = serverUrl + "/?command=get_stats";
+                HttpRequest request = HttpRequest.newBuilder()
+                        .uri(URI.create(url))
+                        .timeout(Duration.ofMillis(500))
+                        .GET()
+                        .build();
+
+                HttpResponse<String> response = httpClient.send(request,
+                        HttpResponse.BodyHandlers.ofString());
+
+                if (response.statusCode() == 200) {
+                    connected = true;
+                    failureCount = 0;
+                    LOGGER.info("✅ Connected to server: {}", serverUrl);
+                }
+
+            } catch (Exception e) {
+                connected = false;
+                LOGGER.error("❌ Failed to connect: {}", e.getMessage());
+            }
+        });
+    }
+
+    // ==================== 재연결 ====================
+    
+    public void reconnect(String ip, int port) {
+        LOGGER.info("🔄 Reconnecting to {}:{}", ip, port);
+        this.serverIp = ip;
+        this.serverPort = port;
+        this.serverUrl = String.format("http://%s:%d", ip, port);
+        this.failureCount = 0;
+        this.connected = false;
+
+        commandQueue.clear();
+        lastSentJoint.clear();
+
+        testConnection();
+        
+        try {
+            WebotsConfigScreen.Config.getInstance().update(ip, port);
+        } catch (Exception e) {
+            LOGGER.warn("Failed to save config", e);
+        }
+    }
+
+    // ==================== 통계 ====================
+    
+    public void printStats() {
+        LOGGER.info("=== WebotsController Stats ===");
+        LOGGER.info("  Mode: {}", currentMode);
+        LOGGER.info("  Target: {}:{} {}", serverIp, serverPort, connected ? "✅" : "❌");
+        
+        if (currentMode == Mode.WEBOTS) {
+            LOGGER.info("  [Webots] Queued: {} | Sent: {} | Failed: {}", 
+                       stats.queued, stats.sent, stats.failed);
+            LOGGER.info("  [Webots] Delta Skipped: {} | Queue Full: {}", 
+                       stats.deltaSkipped, stats.queueFull);
+        } else {
+            LOGGER.info("  [RobotListener] Walk: {} | Head: {} | Failed: {}", 
+                       stats.walkSent, stats.headSent, stats.failed);
         }
     }
 
     public String getStatsJson() {
         try {
-            String url = webotsUrl + "/?command=get_stats";
+            String url = serverUrl + "/?command=get_stats";
             HttpRequest request = HttpRequest.newBuilder()
                     .uri(URI.create(url))
                     .timeout(Duration.ofMillis(200))
@@ -321,28 +491,24 @@ public class WebotsController {
         }
     }
 
-    public void printStats() {
-        LOGGER.info("=== Webots Controller Stats ===");
-        LOGGER.info("  Target: {}:{} {}", robotIp, robotPort, connected ? "✅" : "❌");
-        LOGGER.info("  Queued: {} | Sent: {} | Failed: {}", stats.queued, stats.sent, stats.failed);
-        LOGGER.info("  Delta Skipped: {} | Range Clamped: {} | Queue Full: {}",
-                   stats.deltaSkipped, stats.rangeClamped, stats.queueFull);
-        LOGGER.info("  Queue Size: {} | Failure Count: {}", commandQueue.size(), failureCount);
+    // ==================== Getters ====================
+    
+    public boolean isConnected() { return connected; }
+    public boolean isRobotListenerEnabled() { return robotListenerEnabled; }
+    public String getRobotAddress() { return String.format("%s:%d", serverIp, serverPort); }
+    public long getWalkSent() { return stats.walkSent; }
+    public long getHeadSent() { return stats.headSent; }
+    public long getErrors() { return stats.failed; }
 
-        String serverStats = getStatsJson();
-        LOGGER.info("  Server Stats: {}", serverStats);
-    }
-
-    public boolean isConnected() {
-        return connected;
-    }
-
-    public String getRobotAddress() {
-        return String.format("%s:%d", robotIp, robotPort);
-    }
-
+    // ==================== 종료 ====================
+    
     public void shutdown() {
         LOGGER.info("🛑 Shutting down WebotsController...");
+        
+        if (robotListenerEnabled) {
+            sendStopAll();
+        }
+        
         scheduler.shutdown();
         executor.shutdown();
         try {
@@ -355,17 +521,21 @@ public class WebotsController {
         LOGGER.info("✅ WebotsController shutdown complete");
     }
 
-    // ========== 내부 클래스 ==========
-
+    // ==================== 내부 클래스 ====================
+    
+    private enum CommandType {
+        SET_JOINT
+    }
+    
     private static class Command {
-        final int index;
+        final CommandType type;
+        final int motorIndex;
         final float value;
-        final long timestamp;
-
-        Command(int index, float value) {
-            this.index = index;
+        
+        Command(CommandType type, int motorIndex, float value) {
+            this.type = type;
+            this.motorIndex = motorIndex;
             this.value = value;
-            this.timestamp = System.currentTimeMillis();
         }
     }
 
@@ -384,60 +554,41 @@ public class WebotsController {
     }
 
     private static class Stats {
+        // Webots 모드
         long queued = 0;
         long sent = 0;
-        long failed = 0;
         long deltaSkipped = 0;
-        long rangeClamped = 0;
         long queueFull = 0;
+        
+        // RobotListener 모드
+        long walkSent = 0;
+        long headSent = 0;
+        
+        // 공통
+        long failed = 0;
         final Map<String, Integer> unknownJointWarnings = new ConcurrentHashMap<>();
     }
 
-    private static float clamp(float value, float min, float max) {
-        return Math.max(min, Math.min(max, value));
+    // ==================== 유틸리티 ====================
+    
+    private static float clamp(float v, float min, float max) {
+        return v < min ? min : (v > max ? max : v);
     }
-
-    // ========== 유틸리티 메서드 ==========
-
-    public static String[] getSupportedJoints() {
-        return JOINT_MAP.keySet().toArray(new String[0]);
-    }
-
-    public static JointMapping getJointMapping(String jointName) {
-        return JOINT_MAP.get(jointName);
-    }
-
-    public static Integer getMotorIndex(String jointName) {
-        JointMapping mapping = JOINT_MAP.get(jointName);
-        return mapping != null ? mapping.index : null;
-    }
-
-    // ====================== URDF → Webots 변환기 (여기가 진짜 정답) ======================
-    private float convertUrdfToWebots(String jointName, float urdfValue) {
-        return switch (jointName) {
-            // 팔꿈치 (가장 큰 문제였던 부분)
-            case "r_el" -> map(urdfValue, 0.0f, 2.7925f, -0.10f, -1.57f);   // 양수 → 음수 반전
-            case "l_el" -> map(urdfValue, -2.7925f, 0.0f, -1.57f, -0.10f); // 음수 → 음수
-
-            // 무릎 (역방향)
-            case "r_knee", "l_knee" -> map(urdfValue, -2.27f, 0.0f, 2.09f, -0.1f);
-
-            // 머리 (Webots가 더 좁음)
-            case "head_pan"  -> clamp(urdfValue, -1.57f, 1.57f);
-            case "head_tilt" -> clamp(urdfValue, -0.52f, 0.52f);
-
-            // 기타 미세 차이
-            case "l_ank_pitch" -> clamp(urdfValue, -1.39f, 1.22f);
-            case "r_hip_yaw"   -> clamp(urdfValue, -1.047f, 1.047f);
-            case "l_hip_yaw"   -> clamp(urdfValue, -0.69f, 2.50f);
-
-            default -> urdfValue; // 나머지는 1:1
-        };
-    }
-
+    
     private float map(float v, float fromLow, float fromHigh, float toLow, float toHigh) {
         if (v <= fromLow) return toLow;
         if (v >= fromHigh) return toHigh;
         return toLow + (v - fromLow) * (toHigh - toLow) / (fromHigh - fromLow);
+    }
+
+    private float convertUrdfToWebots(String jointName, float urdfValue) {
+        return switch (jointName) {
+            case "r_el" -> map(urdfValue, 0.0f, 2.7925f, -0.10f, -1.57f);
+            case "l_el" -> map(urdfValue, -2.7925f, 0.0f, -1.57f, -0.10f);
+            case "r_knee", "l_knee" -> map(urdfValue, -2.27f, 0.0f, 2.09f, -0.1f);
+            case "head_pan" -> clamp(urdfValue, -1.57f, 1.57f);
+            case "head_tilt" -> clamp(urdfValue, -0.52f, 0.52f);
+            default -> urdfValue;
+        };
     }
 }
