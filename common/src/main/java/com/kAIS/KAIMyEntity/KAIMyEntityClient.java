@@ -1,6 +1,5 @@
 package com.kAIS.KAIMyEntity;
 
-import com.kAIS.KAIMyEntity.renderer.MMDModelManager;
 import net.minecraft.client.Minecraft;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -8,9 +7,9 @@ import org.apache.logging.log4j.Logger;
 import java.io.File;
 
 /**
- * 깔끔하게 정리된 클라이언트 초기화
- * - URDF 모델 매니저만 초기화
- * - MMD, VMC, 모션 에디터 모두 제거
+ * 최소 클라이언트 초기화
+ * - 폴더 생성만 하고, 렌더러/MMD/URDF 전부 사용 안 함
+ * - WASD + 마우스 → WebotsController 로 보내는 용도만 남김
  */
 public class KAIMyEntityClient {
     public static final Logger logger = LogManager.getLogger();
@@ -19,13 +18,12 @@ public class KAIMyEntityClient {
 
     public static void initClient() {
         checkKAIMyEntityFolder();
-        MMDModelManager.Init();  // URDF 모델 매니저만 초기화
-        logger.info("KAIMyEntityClient initialized (URDF + Webots)");
+        logger.info("KAIMyEntityClient initialized (RobotListener only)");
     }
 
-    private static void checkKAIMyEntityFolder(){
+    private static void checkKAIMyEntityFolder() {
         File KAIMyEntityFolder = new File(gameDirectory + "/KAIMyEntity");
-        if (!KAIMyEntityFolder.exists()){
+        if (!KAIMyEntityFolder.exists()) {
             logger.info("KAIMyEntity folder not found, creating...");
             KAIMyEntityFolder.mkdir();
         }
