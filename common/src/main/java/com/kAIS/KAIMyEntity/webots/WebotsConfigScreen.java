@@ -1,4 +1,3 @@
-// common/src/main/java/com/kAIS/KAIMyEntity/webots/WebotsConfigScreen.java
 package com.kAIS.KAIMyEntity.webots;
 
 import net.minecraft.client.Minecraft;
@@ -15,14 +14,10 @@ import java.util.Properties;
 
 /**
  * 통합 Webots 설정 GUI
- * - Webots/RobotListener 연결 설정
- * - 모드 전환 (Webots ↔ RobotListener)
- * - 실시간 통계
  */
 public class WebotsConfigScreen extends Screen {
     private static final Logger LOGGER = LogManager.getLogger();
     
-    // UI 색상
     private static final int BG_COLOR = 0xFF0E0E10;
     private static final int PANEL_COLOR = 0xFF1D1F24;
     private static final int TITLE_COLOR = 0xFFFFD770;
@@ -33,7 +28,6 @@ public class WebotsConfigScreen extends Screen {
     private final Screen parent;
     private WebotsController controller;
     
-    // UI 컴포넌트
     private EditBox ipBox;
     private EditBox portBox;
     private Button connectButton;
@@ -63,7 +57,6 @@ public class WebotsConfigScreen extends Screen {
         int centerX = this.width / 2;
         int startY = 80;
         
-        // IP 주소 입력
         this.ipBox = new EditBox(this.font, centerX - 100, startY, 200, 20, 
                 Component.literal("IP Address"));
         
@@ -74,7 +67,6 @@ public class WebotsConfigScreen extends Screen {
         
         startY += 30;
         
-        // 포트 입력
         this.portBox = new EditBox(this.font, centerX - 100, startY, 200, 20,
                 Component.literal("Port"));
         this.portBox.setValue(String.valueOf(config.getLastPort()));
@@ -83,7 +75,6 @@ public class WebotsConfigScreen extends Screen {
         
         startY += 35;
         
-        // 연결/재연결 버튼
         this.connectButton = Button.builder(Component.literal("Connect / Reconnect"), b -> {
             handleConnect();
         }).bounds(centerX - 100, startY, 200, 20).build();
@@ -91,7 +82,6 @@ public class WebotsConfigScreen extends Screen {
         
         startY += 25;
         
-        // 모드 전환 버튼
         updateModeButtonText();
         this.modeButton = Button.builder(Component.literal("Mode: Webots"), b -> {
             handleModeToggle();
@@ -100,13 +90,11 @@ public class WebotsConfigScreen extends Screen {
         
         startY += 25;
         
-        // T-Pose 테스트 버튼
         this.testButton = Button.builder(Component.literal("Test T-Pose"), b -> {
             handleTest();
         }).bounds(centerX - 100, startY, 200, 20).build();
         addRenderableWidget(this.testButton);
         
-        // 닫기 버튼
         this.closeButton = Button.builder(Component.literal("Close"), b -> {
             Minecraft.getInstance().setScreen(parent);
         }).bounds(centerX - 50, this.height - 30, 100, 20).build();
@@ -168,11 +156,9 @@ public class WebotsConfigScreen extends Screen {
             WebotsController.Mode currentMode = controller.getMode();
             
             if (currentMode == WebotsController.Mode.WEBOTS) {
-                // Webots → RobotListener
                 controller.enableRobotListener(true);
                 setStatus("✓ Mode: RobotListener (WASD + Mouse)", CONNECTED_COLOR);
             } else {
-                // RobotListener → Webots
                 controller.enableRobotListener(false);
                 setStatus("✓ Mode: Webots (URDF Joint Control)", CONNECTED_COLOR);
             }
@@ -197,7 +183,6 @@ public class WebotsConfigScreen extends Screen {
         }
         
         try {
-            // T-Pose 자세 전송
             controller.setJoint("r_sho_pitch", 0.3f);
             controller.setJoint("r_sho_roll", 1.57f);
             controller.setJoint("r_el", -0.1f);
@@ -239,10 +224,8 @@ public class WebotsConfigScreen extends Screen {
     
     @Override
     public void render(GuiGraphics graphics, int mouseX, int mouseY, float partialTicks) {
-        // 배경
         graphics.fill(0, 0, this.width, this.height, BG_COLOR);
         
-        // 메인 패널
         int panelX = this.width / 2 - 250;
         int panelY = 50;
         int panelW = 500;
@@ -251,23 +234,20 @@ public class WebotsConfigScreen extends Screen {
         
         super.render(graphics, mouseX, mouseY, partialTicks);
         
-        // 제목
         graphics.pose().pushPose();
         graphics.pose().translate(0, 0, 1000.0f);
         graphics.drawCenteredString(this.font, "Webots/RobotListener Settings", 
                 this.width / 2, 20, TITLE_COLOR);
         
-        // 라벨
         graphics.drawString(this.font, "IP Address:", this.width / 2 - 100, 68, TEXT_COLOR, false);
         graphics.drawString(this.font, "Port:", this.width / 2 - 100, 98, TEXT_COLOR, false);
         
-        // 연결 상태
         int statusY = 195;
         if (controller != null) {
             boolean connected = controller.isConnected();
             WebotsController.Mode mode = controller.getMode();
             
-            String connStatus = connected ? "§a● CONNECTED" : "§c● DISCONNECTED";
+            String connStatus = connected ? "● CONNECTED" : "● DISCONNECTED";
             graphics.drawCenteredString(this.font, connStatus, this.width / 2, statusY, 
                     connected ? CONNECTED_COLOR : DISCONNECTED_COLOR);
             
@@ -281,17 +261,15 @@ public class WebotsConfigScreen extends Screen {
                         statusY + 24, TITLE_COLOR);
             }
         } else {
-            graphics.drawCenteredString(this.font, "§c● NOT INITIALIZED", 
+            graphics.drawCenteredString(this.font, "● NOT INITIALIZED", 
                     this.width / 2, statusY, DISCONNECTED_COLOR);
         }
         
-        // 상태 메시지
         if (!statusMessage.isEmpty()) {
             graphics.drawCenteredString(this.font, statusMessage, 
                     this.width / 2, statusY + 45, statusColor);
         }
         
-        // 통계 패널
         if (controller != null && controller.isConnected()) {
             int statsY = statusY + 75;
             graphics.drawString(this.font, "=== Statistics ===", 
@@ -306,7 +284,6 @@ public class WebotsConfigScreen extends Screen {
                         panelX + 20, statsY + 45, 
                         controller.getErrors() > 0 ? DISCONNECTED_COLOR : CONNECTED_COLOR, false);
                 
-                // 사용법
                 int helpY = statsY + 70;
                 graphics.drawString(this.font, "=== Controls ===", 
                         panelX + 20, helpY, TITLE_COLOR, false);
@@ -324,7 +301,6 @@ public class WebotsConfigScreen extends Screen {
         
         graphics.pose().popPose();
         
-        // 주기적 업데이트
         if (++autoRefreshTicker >= 20) {
             autoRefreshTicker = 0;
             updateButtonStates();
