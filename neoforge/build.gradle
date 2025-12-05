@@ -1,5 +1,5 @@
 plugins {
-    id "com.github.johnrengelman.shadow" version "7.1.2"
+    id "com.github.johnrengelman.shadow" version "8.1.1"  // 7.1.2 -> 8.1.1로 업그레이드
 }
 
 architectury {
@@ -9,29 +9,30 @@ architectury {
 
 configurations {
     common
-    shadowCommon // Don't use shadow from the shadow plugin since it *excludes* files.
+    shadowCommon
     compileClasspath.extendsFrom common
     runtimeClasspath.extendsFrom common
     developmentNeoForge.extendsFrom common
 }
 
-dependencies {
-    neoForge "net.neoforged:neoforge:${rootProject.neoforge_version}"
-    // Remove the next line if you don't want to depend on the API
-    //modApi "dev.architectury:architectury-neoforge:${rootProject.architectury_version}"
-
-    common(project(path: ":common", configuration: "namedElements")) { transitive false }
-    shadowCommon(project(path: ":common", configuration: "transformProductionNeoForge")) { transitive = false }
+repositories {
+    mavenCentral() 
+    maven { url = 'https://maven.neoforged.net/releases' }
 }
 
-repositories {
-    maven { url = 'https://maven.neoforged.net/releases' }
+dependencies {
+    neoForge "net.neoforged:neoforge:${rootProject.neoforge_version}"
+    
+    common(project(path: ":common", configuration: "namedElements")) { transitive false }
+    shadowCommon(project(path: ":common", configuration: "transformProductionNeoForge")) { transitive = false }
+    
+    //shadowCommon 'org.ode4j:core:0.5.4'
 }
 
 processResources {
     inputs.property "version", project.version
     inputs.property "neoforge_version_range", project.neoforge_version_range
-
+    
     filesMatching("META-INF/neoforge.mods.toml") {
         expand(rootProject.properties)
     }
@@ -41,8 +42,21 @@ shadowJar {
     exclude "fabric.mod.json"
     exclude "architectury.common.json"
 
+    // 서명 파일 제거
+    exclude "META-INF/*.SF"
+    exclude "META-INF/*.DSA"
+    exclude "META-INF/*.RSA"
+    exclude "META-INF/*.QI"
+    exclude "META-INF/*.EC"
+    
+    // 불필요한 메타데이터 제거
+    exclude "META-INF/maven/**"
+
     configurations = [project.configurations.shadowCommon]
     archiveClassifier = "dev-shadow"
+
+    // 패키지 재배치
+    relocate 'org.ode4j', 'com.kAIS.KAIMyEntity.lib.ode4j'
 }
 
 remapJar {
@@ -70,15 +84,14 @@ publishing {
             from components.java
         }
     }
-
-    // See https://docs.gradle.org/current/userguide/publishing_maven.html for information on how to set up publishing.
+    
     repositories {
         // Add repositories to publish to here.
     }
 }
 
-runClient{
-	args "--username","Dev"
-	args "--width","1920"
-	args "--height","1080"
+runClient {
+    args "--username", "Dev"
+    args "--width", "1920"
+    args "--height", "1080"
 }
