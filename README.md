@@ -41,7 +41,7 @@ I believe I can significantly improve real robot movement quality without reinfo
 
 ---
 
-## 1. ⚙️ 연산 복잡도 개선 (Computational Speedup)
+## 1. 연산 복잡도 개선 (Computational Speedup)
 
 전통적인 RL 루프에서 가장 큰 병목은 **역기구학(IK)**과 **메시 기반 충돌 감지**입니다. 저희 시스템은 이 둘을 근본적으로 더 저렴한 연산으로 대체합니다.
 
@@ -79,7 +79,7 @@ $$
 
 ---
 
-## 2. ⏳ 총 학습 비용 효율화 (Amortized Cost)
+## 2. 총 학습 비용 효율화 (Amortized Cost)
 
 저희는 **2단계 학습(Two-Phase Training)** 전략을 사용합니다.
 1. **Offline:** 데모 수집 시에만 IK 사용 ($K$ 에피소드)
@@ -100,7 +100,7 @@ $$
 
 ---
 
-## 3. ✨ 샘플 효율성 개선 (Sample Efficiency via VRM Prior)
+## 3. 샘플 효율성 개선 (Sample Efficiency via VRM Prior)
 
 강화학습의 난이도는 탐색해야 할 상태 공간의 크기에 비례합니다. **VRM Prior**는 이 공간을 획기적으로 줄여줍니다.
 
@@ -117,7 +117,7 @@ $$
 
 ---
 
-## 🏆 Summary
+## Summary
 
 이 프로젝트는 **수학적 최적화(FK, Voxel)**와 **데이터 기반 최적화(VRM Prior)**를 결합하여 하드웨어 장벽을 낮췄습니다.
 
