@@ -1,7 +1,6 @@
-Copypackage com.kAIS.KAIMyEntity.rl;
+package com.kAIS.KAIMyEntity.rl;
 
 import com.kAIS.KAIMyEntity.urdf.URDFModelOpenGLWithSTL;
-import com.kAIS.KAIMyEntity.urdf.URDFRobotModel;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -35,7 +34,6 @@ public class RLEnvironmentCore {
     
     // ========== 환경 상태 ==========
     private URDFModelOpenGLWithSTL renderer;
-    private URDFRobotModel robot;
     
     private final Config config = new Config();
     private final List<JointState> jointStates = new ArrayList<>();
@@ -52,7 +50,7 @@ public class RLEnvironmentCore {
     // 학습 상태
     private boolean trainingActive = false;
     private AgentMode agentMode = AgentMode.MANUAL;
-    private final SimpleAgent agent = new SimpleAgent();
+    private SimpleAgent agent;
     
     // 이전 상태 (보상 계산용)
     private float[] prevRootPosition = new float[3];
@@ -75,41 +73,47 @@ public class RLEnvironmentCore {
      */
     public void initialize(URDFModelOpenGLWithSTL renderer) {
         this.renderer = renderer;
-        this.robot = renderer.getRobotModel();
         
-        if (robot == null || robot.joints == null) {
-            log("WARN: No robot model available");
+        if (renderer == null) {
+            log("WARN: Renderer is null");
             isInitialized = false;
             return;
         }
         
-        // 관절 정보 수집
+        // 관절 정보 수집 - 렌더러의 API 사용
         jointStates.clear();
         jointIndexMap.clear();
-        int idx = 0;
         
-        for (var joint : robot.joints) {
-            if (joint.isMovable()) {
-                float lower = (joint.limit != null) ? joint.limit.lower : (float)-Math.PI;
-                float upper = (joint.limit != null) ? joint.limit.upper : (float)Math.PI;
-                
-                JointState js = new JointState();
-                js.name = joint.name;
-                js.position = joint.currentPosition;
-                js.velocity = 0f;
-                js.torque = 0f;
-                js.minLimit = lower;
-                js.maxLimit = upper;
-                js.targetPosition = joint.currentPosition;
-                js.initialPosition = joint.currentPosition;
-                
-                jointStates.add(js);
-                jointIndexMap.put(joint.name, idx++);
-            }
+        List<String> jointNames = renderer.getMovableJointNames();
+        if (jointNames == null || jointNames.isEmpty()) {
+            log("WARN: No movable joints found");
+            isInitialized = false;
+            return;
+        }
+        
+        int idx = 0;
+        for (String jointName : jointNames) {
+            float[] limits = renderer.getJointLimits(jointName);
+            float lower = (limits != null && limits.length >= 2) ? limits[0] : (float)-Math.PI;
+            float upper = (limits != null && limits.length >= 2) ? limits[1] : (float)Math.PI;
+            float currentPos = renderer.getJointPosition(jointName);
+            
+            JointState js = new JointState();
+            js.name = jointName;
+            js.position = currentPos;
+            js.velocity = 0f;
+            js.torque = 0f;
+            js.minLimit = lower;
+            js.maxLimit = upper;
+            js.targetPosition = currentPos;
+            js.initialPosition = currentPos;
+            
+            jointStates.add(js);
+            jointIndexMap.put(jointName, idx++);
         }
         
         // 에이전트 초기화
-        agent.initialize(jointStates.size());
+        agent = new SimpleAgent(jointStates.size(), this::getObservationDim);
         
         isInitialized = true;
         log("Initialized: " + jointStates.size() + " joints, obs=" + getObservationDim() + ", act=" + getActionDim());
@@ -122,6 +126,7 @@ public class RLEnvironmentCore {
      */
     public void tick(float deltaTime) {
         if (!isInitialized || !trainingActive) return;
+        if (agentMode == AgentMode.MANUAL) return;
         
         // 1. 관측 수집
         float[] observation = getObservation();
@@ -296,15 +301,10 @@ public class RLEnvironmentCore {
      * 렌더러와 상태 동기화
      */
     private void syncWithRenderer() {
-        if (robot == null || robot.joints == null) return;
+        if (renderer == null) return;
         
-        for (var joint : robot.joints) {
-            Integer idx = jointIndexMap.get(joint.name);
-            if (idx != null) {
-                JointState js = jointStates.get(idx);
-                // 양방향 동기화
-                joint.currentPosition = js.position;
-            }
+        for (JointState js : jointStates) {
+            renderer.setJointTarget(js.name, js.position);
         }
     }
     
@@ -315,7 +315,8 @@ public class RLEnvironmentCore {
         
         // 1. 관절 위치 (정규화 [-1, 1])
         for (JointState js : jointStates) {
-            float norm = 2f * (js.position - js.minLimit) / (js.maxLimit - js.minLimit) - 1f;
+            float range = js.maxLimit - js.minLimit;
+            float norm = range > 0 ? 2f * (js.position - js.minLimit) / range - 1f : 0f;
             obs.add(clamp(norm, -1f, 1f));
         }
         
@@ -328,16 +329,18 @@ public class RLEnvironmentCore {
         
         // 3. 루트 바디 높이 (정규화)
         float[] rootPos = getRootPosition();
-        obs.add((rootPos[1] - config.minHeight) / (config.maxHeight - config.minHeight));
+        float heightRange = config.maxHeight - config.minHeight;
+        obs.add(heightRange > 0 ? (rootPos[1] - config.minHeight) / heightRange : 0.5f);
         
         // 4. 루트 속도 (수평)
         float[] rootVel = getRootVelocity();
-        obs.add(rootVel[0] / config.targetSpeed); // x
-        obs.add(rootVel[2] / config.targetSpeed); // z
+        float speedScale = config.targetSpeed > 0 ? config.targetSpeed : 1f;
+        obs.add(rootVel[0] / speedScale); // x
+        obs.add(rootVel[2] / speedScale); // z
         
         // 5. 목표 속도와의 차이
         float currentSpeed = (float)Math.sqrt(rootVel[0]*rootVel[0] + rootVel[2]*rootVel[2]);
-        obs.add((config.targetSpeed - currentSpeed) / config.targetSpeed);
+        obs.add(speedScale > 0 ? (config.targetSpeed - currentSpeed) / speedScale : 0f);
         
         // float[] 변환
         float[] result = new float[obs.size()];
@@ -348,13 +351,13 @@ public class RLEnvironmentCore {
     }
     
     private float[] getRootPosition() {
-        // TODO: 실제 루트 위치 연동
-        // 현재는 관절 평균 높이로 추정
+        // 관절 평균 높이로 추정 (실제 구현에서는 루트 바디 위치 사용)
         float avgHeight = 1.0f;
         if (!jointStates.isEmpty()) {
             float sum = 0;
             for (JointState js : jointStates) {
-                sum += (js.position - js.minLimit) / (js.maxLimit - js.minLimit);
+                float range = js.maxLimit - js.minLimit;
+                sum += range > 0 ? (js.position - js.minLimit) / range : 0.5f;
             }
             avgHeight = 0.5f + sum / jointStates.size() * 0.5f;
         }
@@ -363,7 +366,7 @@ public class RLEnvironmentCore {
     
     private float[] getRootVelocity() {
         float[] current = getRootPosition();
-        float dt = config.timeStep;
+        float dt = config.timeStep > 0 ? config.timeStep : 0.02f;
         return new float[]{
             (current[0] - prevRootPosition[0]) / dt,
             (current[1] - prevRootPosition[1]) / dt,
@@ -381,7 +384,8 @@ public class RLEnvironmentCore {
         
         // 2. 높이 유지 보상
         float[] rootPos = getRootPosition();
-        float heightReward = 1f - Math.abs(rootPos[1] - config.targetHeight) / config.targetHeight;
+        float heightDiff = Math.abs(rootPos[1] - config.targetHeight);
+        float heightReward = config.targetHeight > 0 ? 1f - heightDiff / config.targetHeight : 0f;
         reward += heightReward * config.heightRewardWeight;
         
         // 3. 속도 매칭 보상 (목표 속도 추종)
@@ -409,7 +413,8 @@ public class RLEnvironmentCore {
         // 6. 관절 제한 페널티
         float limitPenalty = 0f;
         for (JointState js : jointStates) {
-            float margin = 0.1f * (js.maxLimit - js.minLimit);
+            float range = js.maxLimit - js.minLimit;
+            float margin = 0.1f * range;
             if (js.position < js.minLimit + margin || js.position > js.maxLimit - margin) {
                 limitPenalty += 0.1f;
             }
@@ -423,18 +428,20 @@ public class RLEnvironmentCore {
     }
     
     private float calculateSymmetryReward() {
-        // 간단한 대칭 보상: 이름에 L/R이 있는 관절 쌍 비교
         float symmetry = 0f;
         int pairs = 0;
         
         for (JointState js : jointStates) {
-            if (js.name.contains("_L_") || js.name.contains("Left")) {
-                String rightName = js.name.replace("_L_", "_R_").replace("Left", "Right");
+            if (js.name.contains("_L_") || js.name.contains("Left") || js.name.contains("_l_")) {
+                String rightName = js.name
+                    .replace("_L_", "_R_")
+                    .replace("Left", "Right")
+                    .replace("_l_", "_r_");
                 Integer rightIdx = jointIndexMap.get(rightName);
                 if (rightIdx != null) {
                     JointState rightJs = jointStates.get(rightIdx);
                     float diff = Math.abs(js.position - rightJs.position);
-                    symmetry += 1f - diff / Math.PI;
+                    symmetry += 1f - Math.min(diff / (float)Math.PI, 1f);
                     pairs++;
                 }
             }
@@ -586,6 +593,13 @@ public class RLEnvironmentCore {
     }
     
     /**
+     * 내장 에이전트 접근
+     */
+    public SimpleAgent getAgent() {
+        return agent;
+    }
+    
+    /**
      * 디버그 정보
      */
     public Map<String, Object> getDebugInfo() {
@@ -665,7 +679,7 @@ public class RLEnvironmentCore {
         // 시뮬레이션
         public float timeStep = 0.02f;
         public int maxEpisodeSteps = 500;
-        public int updateInterval = 64;  // 학습 업데이트 간격
+        public int updateInterval = 64;
         
         // 관측
         public boolean includeVelocities = true;
@@ -691,7 +705,7 @@ public class RLEnvironmentCore {
         
         // 목표
         public float targetHeight = 1.0f;
-        public float targetSpeed = 0f;  // 0 = 정지 유지
+        public float targetSpeed = 0f;
         
         // 종료 조건
         public boolean terminateOnFall = true;
@@ -718,7 +732,6 @@ public class RLEnvironmentCore {
             totalSteps += length;
             if (reward > bestReward) bestReward = reward;
             
-            // 최근 100개만 유지
             while (episodeRewards.size() > 100) {
                 episodeRewards.remove(0);
                 episodeLengths.remove(0);
@@ -739,43 +752,40 @@ public class RLEnvironmentCore {
             return (float) sum / episodeLengths.size();
         }
         
-        public float getBestReward() { return bestReward; }
+        public float getBestReward() { return bestReward == Float.NEGATIVE_INFINITY ? 0 : bestReward; }
         public int getTotalSteps() { return totalSteps; }
         public int getEpisodeCount() { return episodeRewards.size(); }
-        
-        public List<Float> getRecentRewards(int n) {
-            int start = Math.max(0, episodeRewards.size() - n);
-            return new ArrayList<>(episodeRewards.subList(start, episodeRewards.size()));
-        }
     }
-    
-    // ========== 내장 에이전트 ==========
     
     /**
      * 간단한 내장 에이전트
      */
-    public class SimpleAgent {
-        private int actionDim;
-        private Random random = new Random();
+    public static class SimpleAgent {
+        private final int actionDim;
+        private final java.util.function.IntSupplier obsDimSupplier;
+        private final Random random = new Random();
         
-        // 경험 버퍼 (간단한 Policy Gradient용)
-        private List<Experience> experiences = new ArrayList<>();
+        // 경험 버퍼
+        private final List<Experience> experiences = new ArrayList<>();
         private static final int BUFFER_SIZE = 2048;
         
-        // 간단한 선형 정책 (학습용)
-        private float[][] weights;  // [obsDim x actDim]
+        // 간단한 선형 정책
+        private float[][] weights;
         private float learningRate = 0.001f;
         
         // VMD 목표 (모방 학습용)
         private float[] imitationTargets;
         
-        public void initialize(int actionDim) {
+        public SimpleAgent(int actionDim, java.util.function.IntSupplier obsDimSupplier) {
             this.actionDim = actionDim;
-            
-            int obsDim = getObservationDim();
+            this.obsDimSupplier = obsDimSupplier;
+            initializeWeights();
+        }
+        
+        private void initializeWeights() {
+            int obsDim = obsDimSupplier.getAsInt();
             weights = new float[obsDim][actionDim];
             
-            // Xavier 초기화
             float scale = (float) Math.sqrt(2.0 / (obsDim + actionDim));
             for (int i = 0; i < obsDim; i++) {
                 for (int j = 0; j < actionDim; j++) {
@@ -797,7 +807,7 @@ public class RLEnvironmentCore {
                     return policyAction(observation, mode == AgentMode.LEARNING);
                     
                 case IMITATION:
-                    return imitationAction(observation);
+                    return imitationAction();
                     
                 case MANUAL:
                 default:
@@ -808,7 +818,7 @@ public class RLEnvironmentCore {
         private float[] randomAction() {
             float[] action = new float[actionDim];
             for (int i = 0; i < actionDim; i++) {
-                action[i] = random.nextFloat() * 2 - 1; // [-1, 1]
+                action[i] = random.nextFloat() * 2 - 1;
             }
             return action;
         }
@@ -820,36 +830,25 @@ public class RLEnvironmentCore {
         private float[] policyAction(float[] obs, boolean explore) {
             float[] action = new float[actionDim];
             
-            // 선형 정책: action = obs * weights
             for (int j = 0; j < actionDim; j++) {
                 float sum = 0;
                 for (int i = 0; i < obs.length && i < weights.length; i++) {
                     sum += obs[i] * weights[i][j];
                 }
-                action[j] = (float) Math.tanh(sum); // [-1, 1]
+                action[j] = (float) Math.tanh(sum);
                 
-                // 탐색 노이즈
                 if (explore) {
-                    action[j] += random.nextGaussian() * 0.2f;
-                    action[j] = clamp(action[j], -1f, 1f);
+                    action[j] += (float)(random.nextGaussian() * 0.2);
+                    action[j] = Math.max(-1f, Math.min(1f, action[j]));
                 }
             }
             
             return action;
         }
         
-        private float[] imitationAction(float[] obs) {
-            // VMD 목표가 있으면 그쪽으로
+        private float[] imitationAction() {
             if (imitationTargets != null && imitationTargets.length == actionDim) {
-                float[] action = new float[actionDim];
-                for (int i = 0; i < actionDim; i++) {
-                    // 현재 위치와 목표의 차이를 행동으로
-                    JointState js = jointStates.get(i);
-                    float target = imitationTargets[i];
-                    float error = target - js.position;
-                    action[i] = clamp(error * 5f, -1f, 1f); // P 제어
-                }
-                return action;
+                return imitationTargets.clone();
             }
             return zeroAction();
         }
@@ -871,7 +870,6 @@ public class RLEnvironmentCore {
         public void update() {
             if (experiences.size() < 64) return;
             
-            // 보상 정규화
             float meanReward = 0;
             for (Experience e : experiences) meanReward += e.reward;
             meanReward /= experiences.size();
@@ -882,24 +880,18 @@ public class RLEnvironmentCore {
             }
             stdReward = (float) Math.sqrt(stdReward / experiences.size() + 1e-8);
             
-            // Policy Gradient 업데이트
             for (Experience e : experiences) {
-                float advantage = (e.reward - meanReward) / stdReward;
+                float advantage = stdReward > 0 ? (e.reward - meanReward) / stdReward : 0;
                 
-                // 그래디언트: d log π(a|s) * advantage
                 for (int j = 0; j < actionDim && j < e.action.length; j++) {
                     for (int i = 0; i < e.obs.length && i < weights.length; i++) {
-                        // 간단한 업데이트: tanh 출력이므로 gradient ≈ action * (1 - action^2)
                         float actionGrad = e.action[j] * (1 - e.action[j] * e.action[j]);
                         weights[i][j] += learningRate * advantage * e.obs[i] * actionGrad;
                     }
                 }
             }
             
-            // 버퍼 클리어
             experiences.clear();
-            
-            log("Policy updated (lr=" + learningRate + ")");
         }
         
         /**
@@ -912,15 +904,15 @@ public class RLEnvironmentCore {
         /**
          * 모방 목표 설정 (관절 이름 -> 값 맵)
          */
-        public void setImitationTargets(Map<String, Float> targetMap) {
+        public void setImitationTargets(Map<String, Float> targetMap, List<String> jointNames) {
             imitationTargets = new float[actionDim];
-            for (int i = 0; i < jointStates.size(); i++) {
-                String name = jointStates.get(i).name;
-                imitationTargets[i] = targetMap.getOrDefault(name, jointStates.get(i).position);
+            for (int i = 0; i < jointNames.size() && i < actionDim; i++) {
+                String name = jointNames.get(i);
+                imitationTargets[i] = targetMap.getOrDefault(name, 0f);
             }
         }
         
-        private class Experience {
+        private static class Experience {
             float[] obs, action, nextObs;
             float reward;
             boolean done;
@@ -933,12 +925,5 @@ public class RLEnvironmentCore {
                 this.done = done;
             }
         }
-    }
-    
-    /**
-     * 내장 에이전트 접근
-     */
-    public SimpleAgent getAgent() {
-        return agent;
     }
 }
