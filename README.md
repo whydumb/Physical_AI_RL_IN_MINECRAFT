@@ -6,10 +6,16 @@
 
 This project allows you to easily explore and enjoy Physical AI Reinforcement Learning through Minecraft. Experience how AI agents learn to interact with a physical environment in an accessible and fun way.
 
-## What is Physical AI RL?
+## What?
 
-Physical AI RL combines:
-- **Physical AI**: AI that interacts with physical environments
-- **Reinforcement Learning**: Learning through trial and error with rewards
 
-Minecraft provides the perfect sandbox environment to experiment with these concepts without the complexity of real-world robotics.
+Other companies train their robots using reinforcement learning with ultra-high-performance GPUs.
+I realized that approach isn't possible with just a laptop's 3060 GPU.
+Simulators like Isaac Sim require direct training of robot joints, which is computationally heavy.
+However, VRM models already contain motion data from human-created bone structures,
+and this includes much more sophisticated 3-axis rotations than robot joint movements (URDF).
+I'm building a lightweight conversion system that directly translates this data into single-axis motor movements.
+This way, robots can quickly replicate human motions without complex training,
+and it uses almost no GPU power.
+If I can fully leverage VRM's vast motion dataset,
+I believe I can significantly improve real robot movement quality without reinforcement learning.
