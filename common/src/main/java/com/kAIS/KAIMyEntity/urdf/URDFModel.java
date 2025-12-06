@@ -50,16 +50,36 @@ public class URDFModel {
         jointByName.put(joint.name, joint);
     }
 
-    public URDFLink getLink(String name) { return linkByName.get(name); }
-    public URDFJoint getJoint(String name) { return jointByName.get(name); }
+    public URDFLink getLink(String name) {
+        return linkByName.get(name);
+    }
 
-    public int getLinkCount() { return links.size(); }
-    public int getJointCount() { return joints.size(); }
+    public URDFJoint getJoint(String name) {
+        return jointByName.get(name);
+    }
+
+    public int getLinkCount() {
+        return links.size();
+    }
+
+    public int getJointCount() {
+        return joints.size();
+    }
 
     public int getMovableJointCount() {
         int c = 0;
         for (URDFJoint j : joints) if (j.isMovable()) c++;
         return c;
+    }
+
+    /** 이름→링크 맵 (읽기 전용 뷰) */
+    public Map<String, URDFLink> getLinksByName() {
+        return Collections.unmodifiableMap(linkByName);
+    }
+
+    /** 이름→조인트 맵 (필요하면) */
+    public Map<String, URDFJoint> getJointsByName() {
+        return Collections.unmodifiableMap(jointByName);
     }
 
     /** parent 링크의 자식 조인트 목록(없으면 빈 리스트) */
@@ -83,10 +103,18 @@ public class URDFModel {
      */
     public void buildHierarchy() {
         linkByName.clear();
-        for (URDFLink l : links) if (l != null && l.name != null) linkByName.put(l.name, l);
+        for (URDFLink l : links) {
+            if (l != null && l.name != null) {
+                linkByName.put(l.name, l);
+            }
+        }
 
         jointByName.clear();
-        for (URDFJoint j : joints) if (j != null && j.name != null) jointByName.put(j.name, j);
+        for (URDFJoint j : joints) {
+            if (j != null && j.name != null) {
+                jointByName.put(j.name, j);
+            }
+        }
 
         childrenByLink.clear();
         parentJointByChildLink.clear();
@@ -113,7 +141,9 @@ public class URDFModel {
                 continue;
             }
 
-            childrenByLink.computeIfAbsent(j.parentLinkName, k -> new ArrayList<>()).add(j);
+            childrenByLink
+                    .computeIfAbsent(j.parentLinkName, k -> new ArrayList<>())
+                    .add(j);
             parentJointByChildLink.put(j.childLinkName, j);
 
             allParents.add(j.parentLinkName);
@@ -155,5 +185,7 @@ public class URDFModel {
         }
     }
 
-    private static boolean isEmpty(String s) { return s == null || s.isEmpty(); }
+    private static boolean isEmpty(String s) {
+        return s == null || s.isEmpty();
+    }
 }
