@@ -1,7 +1,7 @@
 package com.kAIS.KAIMyEntity.urdf;
 
 import com.kAIS.KAIMyEntity.renderer.IMMDModel;
-import com.kAIS.KAIMyEntity.urdf.control.URDFSimpleController;  // ★ 추가
+import com.kAIS.KAIMyEntity.urdf.control.URDFSimpleController;
 import com.mojang.blaze3d.systems.RenderSystem;
 import com.mojang.blaze3d.vertex.PoseStack;
 import com.mojang.blaze3d.vertex.VertexConsumer;
@@ -9,6 +9,8 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.MultiBufferSource;
 import net.minecraft.client.renderer.RenderType;
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.level.Level;
+import net.minecraft.world.phys.Vec3;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.joml.Matrix4f;
@@ -19,9 +21,7 @@ import java.io.File;
 import java.util.*;
 
 /**
- * URDF 모델 렌더링 (STL 메시 포함) + ODE4J 물리 통합
- * ✅ 좌표계 변환 및 위치 보정 수정
- * ★ ODE4J 물리 엔진 통합 완료
+ * URDF 모델 렌더링 + ODE4J 물리 통합 + 블록 충돌 연동 버전
  */
 public class URDFModelOpenGLWithSTL implements IMMDModel {
     private static final Logger logger = LogManager.getLogger();
@@ -30,64 +30,107 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
     private URDFModel robotModel;
     private String modelDir;
 
-    // ★ ODE4J 컨트롤러 추가
     private final URDFSimpleController controller;
-
     private final Map<String, STLLoader.STLMesh> meshCache = new HashMap<>();
 
-    // ✅ 스케일 및 위치 설정
+    // 렌더 전용 스케일 (물리는 1블록 = 1m 기준으로 동작)
     private static final float GLOBAL_SCALE = 5.0f;
+
+    // 기본 루트 높이 + 지면 정렬용 오프셋
     private static final float BASE_HEIGHT = 1.5f;
     private float groundOffset = 0.0f;
-    
+
     private static final boolean FLIP_NORMALS = true;
     private static final boolean DEBUG_MODE = false;
 
-    // ✅ ROS 좌표계: z-up, x-forward
-    // ✅ MC 좌표계: y-up, z-backward
+    // ROS → Minecraft 좌표계 보정
     private static final Vector3f SRC_UP  = new Vector3f(0, 0, 1);
     private static final Vector3f SRC_FWD = new Vector3f(1, 0, 0);
     private static final Vector3f DST_UP  = new Vector3f(0, 1, 0);
     private static final Vector3f DST_FWD = new Vector3f(0, 0, -1);
     private static final Quaternionf Q_ROS2MC = makeUprightQuat(SRC_UP, SRC_FWD, DST_UP, DST_FWD);
 
-    // ✅ 관절 이름 매핑 (VMD 이름 → URDF 이름)
+    // VMD ↔ URDF 조인트 이름 매핑
     private final Map<String, String> jointNameMapping = new HashMap<>();
     private boolean jointMappingInitialized = false;
+
+    // ========================================================================
+    // 생성자 / 초기화
+    // ========================================================================
 
     public URDFModelOpenGLWithSTL(URDFModel robotModel, String modelDir) {
         this.robotModel = robotModel;
         this.modelDir = modelDir;
 
-        // ★ URDFSimpleController 생성 (physics=true로 ODE4J 활성화 시도)
-        this.controller = new URDFSimpleController(robotModel, robotModel.joints, true);
-        logger.info("=== URDFSimpleController created (physics mode: {}) ===", 
-                    controller.isUsingPhysics());
+        initJointNameMapping();
+
+        // 물리 모드 켜서 컨트롤러 생성 (ODE4J + BlockCollisionManager 사용)
+        this.controller = new URDFSimpleController(
+                robotModel,
+                robotModel.joints,
+                true,
+                jointNameMapping
+        );
+
+        logger.info("=== URDFSimpleController created (physics mode: {}) ===",
+                controller.isUsingPhysics());
 
         logger.info("=== URDF renderer Created (Scale: {}) ===", GLOBAL_SCALE);
+
         loadAllMeshes();
-        initJointNameMapping();
         calculateGroundOffset();
     }
 
     /**
-     * ✅ 발-지면 오프셋 자동 계산
+     * STL 메쉬를 전부 미리 로드
+     */
+    private void loadAllMeshes() {
+        logger.info("=== Loading STL meshes ===");
+        int loadedCount = 0;
+
+        for (URDFLink link : robotModel.links) {
+            if (link.visual != null && link.visual.geometry != null) {
+                URDFLink.Geometry g = link.visual.geometry;
+                if (g.type == URDFLink.Geometry.GeometryType.MESH && g.meshFilename != null) {
+                    File f = new File(g.meshFilename);
+                    if (f.exists()) {
+                        STLLoader.STLMesh mesh = STLLoader.load(g.meshFilename);
+                        if (mesh != null) {
+                            // URDF 내 scale 적용
+                            if (g.scale != null &&
+                                (g.scale.x != 1f || g.scale.y != 1f || g.scale.z != 1f)) {
+                                STLLoader.scaleMesh(mesh, g.scale);
+                            }
+                            meshCache.put(link.name, mesh);
+                            loadedCount++;
+                        }
+                    }
+                }
+            }
+        }
+
+        logger.info("=== STL Loading Complete: {}/{} meshes ===",
+                loadedCount, robotModel.getLinkCount());
+    }
+
+    /**
+     * 로봇의 발/최저점 기준으로 groundOffset 계산
      */
     private void calculateGroundOffset() {
         float minZ = 0.0f;
         boolean foundFootLink = false;
-        
+
         for (URDFLink link : robotModel.links) {
             String lowerName = link.name.toLowerCase();
-            if (lowerName.contains("foot") || lowerName.contains("ankle") || 
-                lowerName.contains("toe") || lowerName.contains("sole")) {
-                
+            if (lowerName.contains("foot") || lowerName.contains("ankle") ||
+                lowerName.contains("toe")  || lowerName.contains("sole")) {
+
                 foundFootLink = true;
-                
+
                 if (link.visual != null && link.visual.origin != null) {
                     minZ = Math.min(minZ, link.visual.origin.xyz.z);
                 }
-                
+
                 STLLoader.STLMesh mesh = meshCache.get(link.name);
                 if (mesh != null) {
                     for (STLLoader.Triangle tri : mesh.triangles) {
@@ -98,9 +141,9 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
                 }
             }
         }
-        
+
+        // 발 링크 못 찾으면 전체 메쉬에서 최소 Z
         if (!foundFootLink) {
-            logger.warn("No foot/ankle links found, calculating from all meshes");
             for (STLLoader.STLMesh mesh : meshCache.values()) {
                 for (STLLoader.Triangle tri : mesh.triangles) {
                     for (Vector3f v : tri.vertices) {
@@ -109,36 +152,32 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
                 }
             }
         }
-        
+
+        // 렌더 스케일 적용해서 블록 단위 오프셋으로 변환
         groundOffset = -minZ * GLOBAL_SCALE;
-        logger.info("✓ Ground offset calculated: {:.3f} blocks (raw Z: {:.3f}m, found feet: {})", 
-                    groundOffset, minZ, foundFootLink);
+
+        logger.info("✓ Ground offset: {} blocks (raw Z: {}m, feet: {})",
+                groundOffset, minZ, foundFootLink);
     }
 
     /**
-     * ✅ 관절 이름 매핑 초기화
+     * VMD 스타일 이름을 URDF 조인트 이름과 매핑
      */
     private void initJointNameMapping() {
         logger.info("=== Initializing Joint Name Mapping ===");
-        
-        Set<String> urdfJointNames = new HashSet<>();
-        for (URDFJoint j : robotModel.joints) {
-            urdfJointNames.add(j.name);
-            urdfJointNames.add(j.name.toLowerCase());
-        }
-        
+
         Map<String, String[]> vmdToUrdfCandidates = new HashMap<>();
-        vmdToUrdfCandidates.put("head_pan", new String[]{"head_pan", "HeadYaw", "head_yaw", "Neck", "neck"});
-        vmdToUrdfCandidates.put("head_tilt", new String[]{"head_tilt", "HeadPitch", "head_pitch", "Head", "head"});
-        vmdToUrdfCandidates.put("l_sho_pitch", new String[]{"l_sho_pitch", "LShoulderPitch", "l_shoulder_pitch", "LeftShoulderPitch", "left_shoulder_pitch"});
-        vmdToUrdfCandidates.put("l_sho_roll", new String[]{"l_sho_roll", "LShoulderRoll", "l_shoulder_roll", "LeftShoulderRoll", "left_shoulder_roll"});
-        vmdToUrdfCandidates.put("l_el", new String[]{"l_el", "LElbowYaw", "l_elbow", "LeftElbow", "left_elbow", "LElbowRoll"});
-        vmdToUrdfCandidates.put("r_sho_pitch", new String[]{"r_sho_pitch", "RShoulderPitch", "r_shoulder_pitch", "RightShoulderPitch", "right_shoulder_pitch"});
-        vmdToUrdfCandidates.put("r_sho_roll", new String[]{"r_sho_roll", "RShoulderRoll", "r_shoulder_roll", "RightShoulderRoll", "right_shoulder_roll"});
-        vmdToUrdfCandidates.put("r_el", new String[]{"r_el", "RElbowYaw", "r_elbow", "RightElbow", "right_elbow", "RElbowRoll"});
-        vmdToUrdfCandidates.put("l_hip_pitch", new String[]{"l_hip_pitch", "LHipPitch", "LeftHipPitch"});
-        vmdToUrdfCandidates.put("r_hip_pitch", new String[]{"r_hip_pitch", "RHipPitch", "RightHipPitch"});
-        
+        vmdToUrdfCandidates.put("head_pan",     new String[]{"head_pan", "HeadYaw", "head_yaw", "Neck", "neck"});
+        vmdToUrdfCandidates.put("head_tilt",    new String[]{"head_tilt", "HeadPitch", "head_pitch", "Head", "head"});
+        vmdToUrdfCandidates.put("l_sho_pitch",  new String[]{"l_sho_pitch", "LShoulderPitch", "l_shoulder_pitch"});
+        vmdToUrdfCandidates.put("l_sho_roll",   new String[]{"l_sho_roll", "LShoulderRoll",  "l_shoulder_roll"});
+        vmdToUrdfCandidates.put("l_el",         new String[]{"l_el", "LElbowYaw", "l_elbow", "LElbowRoll"});
+        vmdToUrdfCandidates.put("r_sho_pitch",  new String[]{"r_sho_pitch", "RShoulderPitch", "r_shoulder_pitch"});
+        vmdToUrdfCandidates.put("r_sho_roll",   new String[]{"r_sho_roll", "RShoulderRoll",  "r_shoulder_roll"});
+        vmdToUrdfCandidates.put("r_el",         new String[]{"r_el", "RElbowYaw", "r_elbow", "RElbowRoll"});
+        vmdToUrdfCandidates.put("l_hip_pitch",  new String[]{"l_hip_pitch", "LHipPitch", "LeftHipPitch"});
+        vmdToUrdfCandidates.put("r_hip_pitch",  new String[]{"r_hip_pitch", "RHipPitch", "RightHipPitch"});
+
         for (Map.Entry<String, String[]> entry : vmdToUrdfCandidates.entrySet()) {
             String vmdName = entry.getKey();
             for (String candidate : entry.getValue()) {
@@ -152,285 +191,181 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
                 if (jointNameMapping.containsKey(vmdName)) break;
             }
         }
-        
+
         jointMappingInitialized = true;
         logger.info("=== Joint Mapping Complete: {} mappings ===", jointNameMapping.size());
     }
 
-    private void loadAllMeshes() {
-        logger.info("=== Loading STL meshes ===");
-        int loadedCount = 0;
-        for (URDFLink link : robotModel.links) {
-            if (link.visual != null && link.visual.geometry != null) {
-                URDFLink.Geometry g = link.visual.geometry;
-                if (g.type == URDFLink.Geometry.GeometryType.MESH && g.meshFilename != null) {
-                    File f = new File(g.meshFilename);
-                    if (f.exists()) {
-                        STLLoader.STLMesh mesh = STLLoader.load(g.meshFilename);
-                        if (mesh != null) {
-                            if (g.scale != null && (g.scale.x != 1f || g.scale.y != 1f || g.scale.z != 1f)) {
-                                STLLoader.scaleMesh(mesh, g.scale);
-                            }
-                            meshCache.put(link.name, mesh);
-                            loadedCount++;
-                            logger.info("  ✓ Loaded mesh for '{}': {} tris", link.name, mesh.getTriangleCount());
-                        }
-                    }
-                }
-            }
-        }
-        logger.info("=== STL Loading Complete: {}/{} meshes ===", loadedCount, robotModel.getLinkCount());
-    }
+    // ========================================================================
+    // 업데이트 / 월드 컨텍스트
+    // ========================================================================
 
-    // ★ 물리 step의 단일 진입점
     /**
-     * 매 틱 호출: 물리/애니메이션 업데이트
-     *  - PHYSICS 모드: URDFSimpleController.update(dt) → PhysicsManager.step(dt)
-     *  - KINEMATIC 모드: 키네마틱 업데이트만 수행
+     * 구버전 호환용 단순 업데이트 (월드 정보 없음)
      */
     public void tickUpdate(float dt) {
+        tickUpdate(dt, null);
+    }
+
+    /**
+     * 월드/엔티티 정보 함께 전달하는 버전
+     */
+    public void tickUpdate(float dt, Entity entity) {
         if (controller != null) {
+            if (entity != null) {
+                controller.setWorldContext(entity.level(), entity.position());
+            }
             controller.update(dt);
         }
     }
 
-    // ★ 조인트 이름 해석 헬퍼 (매핑 + 대소문자 무시)
-    /**
-     * VMD 이름 매핑/대소문자 무시까지 포함해서 URDFJoint를 찾아줌
-     */
-    private URDFJoint resolveJoint(String name) {
+    // ========================================================================
+    // 조인트 제어 유틸
+    // ========================================================================
+
+    private String resolveJointName(String name) {
         if (name == null) return null;
 
-        // 1. 매핑 적용
+        // 1차: VMD → URDF 매핑
         String mappedName = jointNameMapping.getOrDefault(name, name);
 
-        URDFJoint j = getJointByName(mappedName);
-        if (j != null) return j;
-
-        // 2. 매핑된 이름 안 맞으면 원본 이름도 시도
-        if (!mappedName.equals(name)) {
-            j = getJointByName(name);
-            if (j != null) return j;
+        // 컨트롤러에 실제 존재하는지 확인
+        if (controller.hasJoint(mappedName)) {
+            return mappedName;
         }
 
-        // 3. 대소문자 무시
-        return getJointByNameIgnoreCase(name);
+        // 매핑 이름이 없으면 원래 이름도 한 번 더 체크
+        if (!mappedName.equals(name) && controller.hasJoint(name)) {
+            return name;
+        }
+
+        // 대소문자 무시 검색
+        String found = controller.findJointIgnoreCase(name);
+        if (found != null) return found;
+
+        return null;
     }
 
-    // ★ RL/컨트롤에서 쓰는 진짜 관절 타겟 설정
-    /**
-     * RL/컨트롤에서 쓰는 "진짜" 관절 타겟 설정
-     *  - PHYSICS 모드: URDFSimpleController.setTarget()으로 넘김
-     *  - KINEMATIC 모드: URDFJoint.currentPosition을 직접 갱신
-     */
     public void setJointTarget(String name, float value) {
-        URDFJoint j = resolveJoint(name);
-        if (j == null) {
-            if (DEBUG_MODE && renderCount < 5) {
-                logger.warn("✗ Joint NOT FOUND in setJointTarget: '{}'", name);
-            }
-            return;
-        }
+        if (controller == null) return;
 
-        if (controller != null && controller.isUsingPhysics()) {
-            // 물리 모드 → URDFSimpleController에 목표 각도 전달
-            controller.setTarget(j.name, value);
-        } else {
-            // 키네마틱 모드 → 바로 URDFJoint에 반영
-            j.currentPosition = value;
+        String resolvedName = resolveJointName(name);
+        if (resolvedName != null) {
+            controller.setTarget(resolvedName, value);
+        } else if (DEBUG_MODE && renderCount < 5) {
+            logger.warn("✗ Joint NOT FOUND: '{}'", name);
         }
     }
 
-    /**
-     * ✅ 여러 관절 한번에 설정
-     */
     public void setJointTargets(Map<String, Float> values) {
         for (Map.Entry<String, Float> entry : values.entrySet()) {
             setJointTarget(entry.getKey(), entry.getValue());
         }
     }
 
-    // ★ 속도 제어용 API (VELOCITY 액션 모드용)
-    /**
-     * 관절 목표 속도 설정 (VELOCITY 액션 모드용)
-     */
     public void setJointVelocity(String name, float velocity) {
-        URDFJoint j = resolveJoint(name);
-        if (j == null) return;
-
-        if (controller != null && controller.isUsingPhysics()) {
-            controller.setTargetVelocity(j.name, velocity);
-        } else {
-            // 키네마틱 모드일 때는 미리보기용으로만
-            j.currentVelocity = velocity;
+        if (controller == null) return;
+        String resolvedName = resolveJointName(name);
+        if (resolvedName != null) {
+            controller.setTargetVelocity(resolvedName, velocity);
         }
     }
 
-    /**
-     * ✅ 즉시 반영(프리뷰용) - 툴에서만 사용
-     */
     public void setJointPreview(String name, float value) {
-        String mappedName = jointNameMapping.getOrDefault(name, name);
-        URDFJoint j = getJointByName(mappedName);
-        
-        if (j == null && !mappedName.equals(name)) {
-            j = getJointByName(name);
-        }
-        if (j == null) {
-            j = getJointByNameIgnoreCase(name);
-        }
-        
-        if (j != null) {
-            j.currentPosition = value;
-            if (DEBUG_MODE && renderCount < 5) {
-                logger.info("✓ Joint '{}' -> '{}' = {} rad ({} deg)", 
-                    name, j.name, value, Math.toDegrees(value));
-            }
-        } else {
-            if (DEBUG_MODE && renderCount < 5) {
-                logger.warn("✗ Joint NOT FOUND: '{}' (mapped: '{}')", name, mappedName);
-            }
+        if (controller == null) return;
+        String resolvedName = resolveJointName(name);
+        if (resolvedName != null) {
+            controller.setPreviewPosition(resolvedName, value);
         }
     }
 
-    // ★ RL용 정보 API들
-    /**
-     * 현재 관절 속도 반환 (URDFJoint.currentVelocity 기반)
-     */
     public float getJointVelocity(String jointName) {
-        if (robotModel != null && robotModel.joints != null) {
-            for (URDFJoint joint : robotModel.joints) {
-                if (joint.name.equals(jointName)) {
-                    return joint.currentVelocity;
-                }
-            }
-        }
-        return 0f;
+        if (controller == null) return 0f;
+        String resolvedName = resolveJointName(jointName);
+        return resolvedName != null ? controller.getJointVelocity(resolvedName) : 0f;
     }
 
-    /**
-     * 루트 링크(world 기준) 위치 반환
-     *  - PHYSICS 모드: URDFSimpleController + PhysicsManager에서 실제 ODE 바디 위치
-     *  - Fallback: 렌더러의 BASE_HEIGHT + groundOffset 기준 가짜 값
-     */
-    public float[] getRootWorldPosition() {
-        if (controller != null && controller.isUsingPhysics()
-                && robotModel != null && robotModel.rootLinkName != null) {
-            return controller.getLinkWorldPosition(robotModel.rootLinkName);
-        }
-
-        // Fallback: 대충 렌더러 기준 높이
-        return new float[]{0.0f, BASE_HEIGHT + groundOffset, 0.0f};
-    }
-
-    /**
-     * 물리 모드 여부 반환
-     */
-    public boolean isUsingPhysics() {
-        return controller != null && controller.isUsingPhysics();
-    }
-
-    /**
-     * 컨트롤러 직접 접근 (필요시)
-     */
-    public URDFSimpleController getController() {
-        return controller;
-    }
-
-    // ===== 기존 API 유지 =====
-    /**
-     * ✅ 이동 가능한 관절 이름 목록 반환
-     */
     public List<String> getMovableJointNames() {
-        List<String> names = new ArrayList<>();
-        if (robotModel != null && robotModel.joints != null) {
-            for (URDFJoint joint : robotModel.joints) {
-                if (joint.isMovable()) {
-                    names.add(joint.name);
-                }
-            }
-        }
-        return names;
+        return controller != null ? controller.getMovableJointNames() : Collections.emptyList();
     }
 
-    /**
-     * ✅ 관절 제한값 반환 [lower, upper]
-     */
     public float[] getJointLimits(String jointName) {
-        if (robotModel != null && robotModel.joints != null) {
-            for (URDFJoint joint : robotModel.joints) {
-                if (joint.name.equals(jointName) && joint.limit != null) {
-                    return new float[]{joint.limit.lower, joint.limit.upper};
-                }
-            }
-        }
-        return new float[]{(float)-Math.PI, (float)Math.PI};
+        if (controller == null) return new float[]{(float) -Math.PI, (float) Math.PI};
+        String resolvedName = resolveJointName(jointName);
+        return resolvedName != null
+                ? controller.getJointLimits(resolvedName)
+                : new float[]{(float) -Math.PI, (float) Math.PI};
     }
 
-    /**
-     * ✅ 현재 관절 위치 반환
-     */
     public float getJointPosition(String jointName) {
-        if (robotModel != null && robotModel.joints != null) {
-            for (URDFJoint joint : robotModel.joints) {
-                if (joint.name.equals(jointName)) {
-                    return joint.currentPosition;
-                }
-            }
-        }
-        return 0f;
+        if (controller == null) return 0f;
+        String resolvedName = resolveJointName(jointName);
+        return resolvedName != null ? controller.getJointPosition(resolvedName) : 0f;
     }
 
-    /**
-     * ✅ 모든 관절의 현재 위치를 Map으로 반환
-     */
     public Map<String, Float> getAllJointPositions() {
-        Map<String, Float> positions = new HashMap<>();
-        if (robotModel != null && robotModel.joints != null) {
-            for (URDFJoint joint : robotModel.joints) {
-                if (joint.isMovable()) {
-                    positions.put(joint.name, joint.currentPosition);
-                }
-            }
-        }
-        return positions;
+        return controller != null ? controller.getAllJointPositions() : Collections.emptyMap();
     }
 
-    /**
-     * ✅ 모든 관절 목록 출력 (디버깅용)
-     */
+    public Set<String> getJointNames() {
+        return controller != null ? controller.getJointNameSet() : Collections.emptySet();
+    }
+
     public void printAllJoints() {
-        logger.info("=== URDF Joints ({}) ===", robotModel.joints.size());
-        for (URDFJoint j : robotModel.joints) {
-            logger.info("  - '{}' (type: {}, movable: {}, current: {})", 
-                j.name, j.type, j.isMovable(), j.currentPosition);
-        }
         logger.info("=== Joint Name Mappings ({}) ===", jointNameMapping.size());
         for (Map.Entry<String, String> entry : jointNameMapping.entrySet()) {
             logger.info("  - '{}' -> '{}'", entry.getKey(), entry.getValue());
         }
     }
 
+    // ========================================================================
+    // 루트 위치 / 물리 사용 여부
+    // ========================================================================
+
     /**
-     * ✅ 관절 이름 Set 반환 (VMDParser용)
+     * 물리 루트 위치(엔티티 로컬 좌표) → 없으면 기본 높이 반환
      */
-    public Set<String> getJointNames() {
-        Set<String> names = new HashSet<>();
-        for (URDFJoint j : robotModel.joints) {
-            names.add(j.name);
+    public float[] getRootWorldPosition() {
+        if (controller != null && controller.isUsingPhysics() && robotModel.rootLinkName != null) {
+            // 컨트롤러 쪽에서 루트 로컬 좌표를 관리한다고 가정
+            return controller.getRootLinkLocalPosition();
         }
-        return names;
+        // 물리 안 쓰면 그냥 기본값
+        return new float[]{0.0f, BASE_HEIGHT + groundOffset, 0.0f};
     }
 
-    // ===== 렌더링 =====
+    public boolean isUsingPhysics() {
+        return controller != null && controller.isUsingPhysics();
+    }
+
+    public URDFSimpleController getController() {
+        return controller;
+    }
+
+    public URDFModel getRobotModel() {
+        return robotModel;
+    }
+
+    // ========================================================================
+    // 렌더링
+    // ========================================================================
+
     @Override
     public void Render(Entity entityIn, float entityYaw, float entityPitch,
                        Vector3f entityTrans, float tickDelta, PoseStack poseStack, int packedLight) {
 
         renderCount++;
+
+        // 컨트롤러에 월드 컨텍스트 전달 (블록 충돌/물리에서 사용)
+        if (controller != null && entityIn != null) {
+            Level level = entityIn.level();
+            Vec3 worldPos = entityIn.position();
+            controller.setWorldContext(level, worldPos);
+        }
+
         if (renderCount % 120 == 1) {
-            logger.info("=== URDF RENDER #{} (Scale: {}, Offset: {}, Physics: {}) ===", 
-                       renderCount, GLOBAL_SCALE, groundOffset, isUsingPhysics());
+            logger.info("=== URDF RENDER #{} (Scale: {}, Physics: {}) ===",
+                    renderCount, GLOBAL_SCALE, isUsingPhysics());
         }
 
         RenderSystem.enableBlend();
@@ -438,15 +373,31 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
         RenderSystem.enableDepthTest();
         RenderSystem.disableCull();
 
-        MultiBufferSource.BufferSource bufferSource = Minecraft.getInstance().renderBuffers().bufferSource();
+        MultiBufferSource.BufferSource bufferSource =
+                Minecraft.getInstance().renderBuffers().bufferSource();
         VertexConsumer vc = bufferSource.getBuffer(RenderType.solid());
 
         if (robotModel.rootLinkName != null) {
             poseStack.pushPose();
 
-            float totalYOffset = BASE_HEIGHT + groundOffset;
-            poseStack.translate(0.0f, totalYOffset, 0.0f);
+            if (controller != null && controller.isUsingPhysics()) {
+                // ★ 물리 모드: 루트 링크 로컬 위치(ODE 좌표)를 렌더 위치에 반영
+                float[] rootLocal = controller.getRootLinkLocalPosition();
+                poseStack.translate(
+                        rootLocal[0],
+                        rootLocal[1] + BASE_HEIGHT + groundOffset,
+                        rootLocal[2]
+                );
+            } else {
+                // 키네마틱 모드: 기존 고정 오프셋
+                float totalYOffset = BASE_HEIGHT + groundOffset;
+                poseStack.translate(0.0f, totalYOffset, 0.0f);
+            }
+
+            // ROS → Minecraft 좌표계 회전
             poseStack.mulPose(new Quaternionf(Q_ROS2MC));
+
+            // 메쉬 스케일 (위치에는 스케일 다시 안 곱함)
             poseStack.scale(GLOBAL_SCALE, GLOBAL_SCALE, GLOBAL_SCALE);
 
             renderLinkRecursive(robotModel.rootLinkName, poseStack, vc, packedLight);
@@ -455,9 +406,11 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
 
         bufferSource.endBatch(RenderType.solid());
         RenderSystem.enableCull();
+
     }
 
-    private void renderLinkRecursive(String linkName, PoseStack poseStack, VertexConsumer vc, int packedLight) {
+    private void renderLinkRecursive(String linkName, PoseStack poseStack,
+                                     VertexConsumer vc, int packedLight) {
         URDFLink link = robotModel.getLink(linkName);
         if (link == null) return;
 
@@ -477,7 +430,8 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
         poseStack.popPose();
     }
 
-    private void renderVisual(URDFLink link, PoseStack poseStack, VertexConsumer vc, int packedLight) {
+    private void renderVisual(URDFLink link, PoseStack poseStack,
+                              VertexConsumer vc, int packedLight) {
         if (link.visual == null || link.visual.geometry == null) return;
 
         poseStack.pushPose();
@@ -490,24 +444,25 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
         if (mesh != null) {
             renderMesh(mesh, link, poseStack, vc, packedLight);
         }
+
         poseStack.popPose();
     }
 
-    private void renderMesh(STLLoader.STLMesh mesh, URDFLink link, PoseStack poseStack,
-                            VertexConsumer vc, int packedLight) {
+    private void renderMesh(STLLoader.STLMesh mesh, URDFLink link,
+                            PoseStack poseStack, VertexConsumer vc, int packedLight) {
         Matrix4f matrix = poseStack.last().pose();
 
         int r = 220, g = 220, b = 220, a = 255;
         if (link.visual.material != null && link.visual.material.color != null) {
             URDFLink.Material.Vector4f color = link.visual.material.color;
-            r = (int)(color.x * 255);
-            g = (int)(color.y * 255);
-            b = (int)(color.z * 255);
-            a = (int)(color.w * 255);
+            r = (int) (color.x * 255);
+            g = (int) (color.y * 255);
+            b = (int) (color.z * 255);
+            a = (int) (color.w * 255);
         }
 
         int blockLight = Math.max((packedLight & 0xFFFF), 0xA0);
-        int skyLight = Math.max((packedLight >> 16) & 0xFFFF, 0xA0);
+        int skyLight   = Math.max((packedLight >> 16) & 0xFFFF, 0xA0);
 
         for (STLLoader.Triangle tri : mesh.triangles) {
             for (int i = 2; i >= 0; i--) {
@@ -526,6 +481,10 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
             }
         }
     }
+
+    // ========================================================================
+    // 변환 유틸
+    // ========================================================================
 
     private void applyLinkOriginTransform(URDFLink.Origin origin, PoseStack poseStack) {
         poseStack.translate(origin.xyz.x, origin.xyz.y, origin.xyz.z);
@@ -561,21 +520,22 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
             case CONTINUOUS: {
                 Vector3f axis;
                 if (joint.axis == null || joint.axis.xyz == null ||
-                        joint.axis.xyz.lengthSquared() < 1e-12f) {
+                    joint.axis.xyz.lengthSquared() < 1e-12f) {
                     axis = new Vector3f(1, 0, 0);
                 } else {
                     axis = new Vector3f(joint.axis.xyz);
                     if (axis.lengthSquared() < 1e-12f) axis.set(1, 0, 0);
                     else axis.normalize();
                 }
-                Quaternionf quat = new Quaternionf().rotateAxis(joint.currentPosition, axis.x, axis.y, axis.z);
+                Quaternionf quat = new Quaternionf()
+                        .rotateAxis(joint.currentPosition, axis.x, axis.y, axis.z);
                 poseStack.mulPose(quat);
                 break;
             }
             case PRISMATIC: {
                 Vector3f axis;
                 if (joint.axis == null || joint.axis.xyz == null ||
-                        joint.axis.xyz.lengthSquared() < 1e-12f) {
+                    joint.axis.xyz.lengthSquared() < 1e-12f) {
                     axis = new Vector3f(1, 0, 0);
                 } else {
                     axis = new Vector3f(joint.axis.xyz);
@@ -591,14 +551,30 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
         }
     }
 
-    // ===== IMMDModel 구현 =====
-    @Override public void ChangeAnim(long anim, long layer) { }
-    @Override public void ResetPhysics() { 
+    // ========================================================================
+    // IMMDModel 구현
+    // ========================================================================
+
+    @Override
+    public void ChangeAnim(long anim, long layer) { }
+
+    @Override
+    public void ResetPhysics() {
         logger.info("ResetPhysics called");
-        // TODO: ODE world 리셋 구현 필요시 여기 추가
+        if (controller != null) {
+            controller.resetPhysics();
+        }
     }
-    @Override public long GetModelLong() { return 0; }
-    @Override public String GetModelDir() { return modelDir; }
+
+    @Override
+    public long GetModelLong() {
+        return 0;
+    }
+
+    @Override
+    public String GetModelDir() {
+        return modelDir;
+    }
 
     public static URDFModelOpenGLWithSTL Create(String urdfPath, String modelDir) {
         File urdfFile = new File(urdfPath);
@@ -608,31 +584,10 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
         return new URDFModelOpenGLWithSTL(robot, modelDir);
     }
 
-    public URDFModel getRobotModel() {
-        return robotModel;
-    }
+    // ========================================================================
+    // 업라이트 보정 유틸
+    // ========================================================================
 
-    // ===== 내부 유틸 =====
-    private URDFJoint getJointByName(String name) {
-        if (name == null) return null;
-        for (URDFJoint j : robotModel.joints) {
-            if (name.equals(j.name)) return j;
-        }
-        return null;
-    }
-
-    /**
-     * ✅ 대소문자 무시하고 관절 찾기
-     */
-    private URDFJoint getJointByNameIgnoreCase(String name) {
-        if (name == null) return null;
-        for (URDFJoint j : robotModel.joints) {
-            if (name.equalsIgnoreCase(j.name)) return j;
-        }
-        return null;
-    }
-
-    // ===== 업라이트 보정 유틸 =====
     private static Quaternionf makeUprightQuat(Vector3f srcUp, Vector3f srcFwd,
                                                Vector3f dstUp, Vector3f dstFwd) {
         Vector3f su = new Vector3f(srcUp).normalize();
@@ -640,9 +595,11 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
         Vector3f du = new Vector3f(dstUp).normalize();
         Vector3f df = new Vector3f(dstFwd).normalize();
 
+        // 1) Up 벡터 정렬
         Quaternionf qUp = fromToQuat(su, du);
         Vector3f sf1 = sf.rotate(new Quaternionf(qUp));
 
+        // 2) Up 축에 수직인 평면에서 Forward 정렬
         Vector3f sf1p = new Vector3f(sf1).sub(new Vector3f(du).mul(sf1.dot(du)));
         Vector3f dfp = new Vector3f(df).sub(new Vector3f(du).mul(df.dot(du)));
         if (sf1p.lengthSquared() < 1e-10f || dfp.lengthSquared() < 1e-10f) {
@@ -665,7 +622,7 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
         Vector3f v2 = new Vector3f(b).normalize();
         float dot = clamp(v1.dot(v2), -1f, 1f);
 
-        if (dot > 1.0f - 1e-6f) return new Quaternionf();
+        if (dot > 1.0f - 1e-6f) return new Quaternionf(); // 동일
         if (dot < -1.0f + 1e-6f) {
             Vector3f axis = pickAnyPerp(v1).normalize();
             return new Quaternionf().fromAxisAngleRad(axis, (float) Math.PI);
@@ -676,8 +633,12 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
     }
 
     private static Vector3f pickAnyPerp(Vector3f v) {
-        Vector3f x = new Vector3f(1, 0, 0), y = new Vector3f(0, 1, 0), z = new Vector3f(0, 0, 1);
-        float dx = Math.abs(v.dot(x)), dy = Math.abs(v.dot(y)), dz = Math.abs(v.dot(z));
+        Vector3f x = new Vector3f(1, 0, 0);
+        Vector3f y = new Vector3f(0, 1, 0);
+        Vector3f z = new Vector3f(0, 0, 1);
+        float dx = Math.abs(v.dot(x));
+        float dy = Math.abs(v.dot(y));
+        float dz = Math.abs(v.dot(z));
         return (dx < dy && dx < dz) ? x : ((dy < dz) ? y : z);
     }
 
