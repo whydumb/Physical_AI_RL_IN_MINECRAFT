@@ -14,7 +14,7 @@ import java.lang.reflect.Method;
 import java.util.*;
 
 /**
- * URDF 컨트롤러 - 물리 + 블록 충돌 통합
+ * URDF 컨트롤러 - 물리 + 블록 충돌 통합 (Geom 추가)
  *
  * 좌표계:
  * - ODE World = 엔티티 로컬 좌표계
@@ -43,22 +43,25 @@ public final class URDFSimpleController {
     private boolean physicsInitialized = false;
 
     private final Map<String, Object> bodies = new HashMap<>();
+    private final Map<String, Object> geoms = new HashMap<>();
     private final Map<String, Object> odeJoints = new HashMap<>();
-    private final Map<String, Float> linkRadii = new HashMap<>();  // 링크별 충돌 반경
+    private final Map<String, Float> linkRadii = new HashMap<>();
 
     private final Map<String, Float> targetVelocities = new HashMap<>();
-    private float physicsKp = 500f;
-    private float physicsKd = 50f;
-    private float maxTorque = 100f;
-    private float maxForce = 500f;
+
+    // 너무 과격하지 않게 초기값 낮춤
+    private float physicsKp = 50f;
+    private float physicsKd = 5f;
+    private float maxTorque = 20f;
+    private float maxForce = 100f;
 
     // ========== 블록 충돌 ==========
     private BlockCollisionManager blockCollisionManager;
     private Level currentLevel;
     private Vec3 worldPosition = Vec3.ZERO;
 
-    // ========== 스케일 (렌더러와 일치) ==========
-    private float physicsScale = 1.0f;  // URDF 단위 → 물리 단위
+    // ========== 스케일 (URDF 단위 → 물리 단위) ==========
+    private float physicsScale = 1.0f;
 
     // ODE4J 버전
     private enum ODE4JVersion { V03X, V04X, V05X, UNKNOWN }
@@ -72,7 +75,8 @@ public final class URDFSimpleController {
     private Class<?> dBodyClass;
     private Class<?> dWorldClass;
     private Class<?> odeHelperClass;
-    private Class<?> dJointGroupClass;  // *** ADDED ***
+    private Class<?> dJointGroupClass;
+    private Class<?> dGeomClass;
 
     private Method massSetBoxMethod;
     private Method massSetSphereMethod;
@@ -119,7 +123,6 @@ public final class URDFSimpleController {
                     detectODE4JVersion();
                     buildPhysicsModel();
 
-                    // 블록 충돌 매니저 생성
                     this.blockCollisionManager = new BlockCollisionManager();
 
                     usePhysics = true;
@@ -127,7 +130,8 @@ public final class URDFSimpleController {
 
                     logger.info("URDFSimpleController: PHYSICS mode");
                     logger.info("  ODE4J version: {}", odeVersion);
-                    logger.info("  Bodies: {}, Joints: {}", bodies.size(), odeJoints.size());
+                    logger.info("  Bodies: {}, Geoms: {}, Joints: {}",
+                            bodies.size(), geoms.size(), odeJoints.size());
                     logger.info("  BlockCollisionManager: active");
 
                 } catch (Exception e) {
@@ -137,6 +141,7 @@ public final class URDFSimpleController {
                 }
             } else {
                 this.usePhysics = false;
+                this.physicsInitialized = false;
                 logger.info("PhysicsManager not initialized, using KINEMATIC mode");
             }
         } else {
@@ -150,10 +155,6 @@ public final class URDFSimpleController {
     // 월드 컨텍스트 (렌더러에서 호출)
     // ========================================================================
 
-    /**
-     * 마인크래프트 월드 참조 및 엔티티 위치 설정
-     * 매 렌더/틱마다 호출해야 함
-     */
     public void setWorldContext(Level level, Vec3 worldPos) {
         this.currentLevel = level;
         this.worldPosition = worldPos != null ? worldPos : Vec3.ZERO;
@@ -175,8 +176,13 @@ public final class URDFSimpleController {
         }
     }
 
+    /**
+     * 물리 + 블록 충돌 업데이트
+     * BlockCollisionManager가 static geometry를 관리하고,
+     * PhysicsManager.step 내부에서 space.collide() + contact 처리가 수행됨.
+     */
     private void updatePhysicsWithCollision(float dt) {
-        // 1. 블록 충돌 영역 업데이트
+        // 1. 블록 static geom 업데이트
         if (blockCollisionManager != null && currentLevel != null) {
             blockCollisionManager.updateCollisionArea(
                     currentLevel,
@@ -186,28 +192,13 @@ public final class URDFSimpleController {
             );
         }
 
-        // 2. 각 바디에 대해 블록 충돌 검사 및 응답
-        if (blockCollisionManager != null && currentLevel != null) {
-            for (Map.Entry<String, Object> entry : bodies.entrySet()) {
-                String linkName = entry.getKey();
-                Object body = entry.getValue();
-
-                // 링크별 충돌 반경 가져오기
-                float radius = linkRadii.getOrDefault(linkName, 0.15f);
-
-                blockCollisionManager.handleBodyBlockCollision(
-                        body, worldPosition, currentLevel, radius
-                );
-            }
-        }
-
-        // 3. 관절 제어 적용
+        // 2. 조인트 제어 (토크/힘 계산)
         applyJointControls();
 
-        // 4. 물리 스텝
+        // 3. ODE 스텝 (중력 + 조인트 + 블록 충돌 전부)
         physics.step(dt);
 
-        // 5. ODE → URDF 동기화
+        // 4. URDF 조인트 상태 동기화
         syncJointStates();
     }
 
@@ -232,18 +223,17 @@ public final class URDFSimpleController {
 
     private void initializeODE4JClasses() throws Exception {
         ClassLoader cl = physics.getClassLoader();
-
-        // 우리의 ode4j는 com.kAIS.ode4j.ode.* 패키지 아래에 있음
         String base = "com.kAIS.ode4j.ode.";
 
         odeHelperClass    = cl.loadClass(base + "OdeHelper");
         dWorldClass       = cl.loadClass(base + "DWorld");
         dBodyClass        = cl.loadClass(base + "DBody");
         dMassClass        = cl.loadClass(base + "DMass");
+        dGeomClass        = cl.loadClass(base + "DGeom");
         dHingeJointClass  = cl.loadClass(base + "DHingeJoint");
         dSliderJointClass = cl.loadClass(base + "DSliderJoint");
         dFixedJointClass  = cl.loadClass(base + "DFixedJoint");
-        dJointGroupClass  = cl.loadClass(base + "DJointGroup");  // *** ADDED ***
+        dJointGroupClass  = cl.loadClass(base + "DJointGroup");
 
         createMassMethod = odeHelperClass.getMethod("createMass");
     }
@@ -254,11 +244,10 @@ public final class URDFSimpleController {
             odeVersion = ODE4JVersion.V03X;
             return;
         } catch (NoSuchMethodException e) {
-            // ignore, 다음 케이스로
+            // ignore
         }
 
         try {
-            // 내부 구현 클래스도 com.kAIS.ode4j.ode.internal.* 에 존재
             physics.getClassLoader().loadClass("com.kAIS.ode4j.ode.internal.DxMass");
             odeVersion = ODE4JVersion.V05X;
             return;
@@ -298,7 +287,7 @@ public final class URDFSimpleController {
         Object world = physics.getWorld();
         findMassSetMethods();
 
-        // 링크 → 강체 (루트 제외)
+        // 링크 → body + geom
         for (URDFLink link : urdfModel.links) {
             if (link == null || isFixedLink(link)) continue;
 
@@ -306,13 +295,12 @@ public final class URDFSimpleController {
             if (body != null) {
                 bodies.put(link.name, body);
 
-                // 링크 크기로 충돌 반경 계산
                 float radius = estimateLinkRadius(link);
                 linkRadii.put(link.name, radius);
             }
         }
 
-        // 조인트 → ODE 조인트
+        // 조인트 생성
         for (URDFJoint joint : joints.values()) {
             if (!joint.isMovable()) continue;
 
@@ -322,16 +310,14 @@ public final class URDFSimpleController {
             }
         }
 
-        logger.info("Physics model: {} bodies, {} joints", bodies.size(), odeJoints.size());
+        logger.info("Physics model: {} bodies, {} geoms, {} joints",
+                bodies.size(), geoms.size(), odeJoints.size());
 
         if (bodies.isEmpty()) {
             throw new IllegalStateException("No ODE bodies created");
         }
     }
 
-    /**
-     * 링크 크기로 충돌 반경 추정
-     */
     private float estimateLinkRadius(URDFLink link) {
         float defaultRadius = 0.1f;
 
@@ -340,7 +326,6 @@ public final class URDFSimpleController {
             switch (g.type) {
                 case BOX:
                     if (g.boxSize != null) {
-                        // 박스 대각선의 절반
                         return (float) Math.sqrt(
                                 g.boxSize.x * g.boxSize.x +
                                         g.boxSize.y * g.boxSize.y +
@@ -353,7 +338,6 @@ public final class URDFSimpleController {
                 case CYLINDER:
                     return Math.max(g.cylinderRadius, g.cylinderLength * 0.5f);
                 case MESH:
-                    // 메시는 스케일 기반 추정
                     if (g.scale != null) {
                         return Math.max(g.scale.x, Math.max(g.scale.y, g.scale.z)) * 0.1f;
                     }
@@ -361,7 +345,6 @@ public final class URDFSimpleController {
             }
         }
 
-        // 이름 기반 추정
         String name = link.name.toLowerCase();
         if (name.contains("torso") || name.contains("body") || name.contains("chest")) {
             return 0.25f;
@@ -376,19 +359,39 @@ public final class URDFSimpleController {
         return defaultRadius;
     }
 
+    // ========================================================================
+    // Body + Geom 생성
+    // ========================================================================
+
     private Object createBodyForLink(URDFLink link, Object world) {
         try {
             Object body = physics.createBody();
             if (body == null) return null;
 
-            setDefaultMass(body, link);
+            // 질량 + geom 정보
+            GeometryInfo geomInfo = setDefaultMass(body, link);
 
-            // 초기 위치 (URDF origin 기반, 엔티티 로컬)
+            // 초기 위치 (엔티티 로컬)
             if (link.visual != null && link.visual.origin != null) {
                 physics.setBodyPosition(body,
                         link.visual.origin.xyz.x * physicsScale,
                         link.visual.origin.xyz.y * physicsScale,
                         link.visual.origin.xyz.z * physicsScale);
+            }
+
+            // Geom 생성
+            Object geom = createGeomForLink(link, geomInfo);
+            if (geom != null) {
+                physics.setGeomBody(geom, body);
+                geoms.put(link.name, geom);
+
+                // 동적 geom 으로 등록 (self-collision 제어용)
+                physics.registerDynamicGeom(geom);
+
+                logger.debug("Created geom for link: {} (type: {})",
+                        link.name, geomInfo.type);
+            } else {
+                logger.warn("Failed to create geom for link: {}", link.name);
             }
 
             return body;
@@ -398,17 +401,71 @@ public final class URDFSimpleController {
         }
     }
 
-    /**
-     * 링크의 질량/관성을 설정.
-     */
-    private void setDefaultMass(Object body, URDFLink link) {
+    // ========================================================================
+    // Geom 생성 헬퍼
+    // ========================================================================
+
+    private static class GeometryInfo {
+        String type;
+        double lx, ly, lz;  // box dimensions
+        double radius;      // sphere/cylinder radius
+        double height;      // cylinder height
+
+        GeometryInfo(String type) {
+            this.type = type;
+        }
+    }
+
+    private Object createGeomForLink(URDFLink link, GeometryInfo geomInfo) {
+        try {
+            Object geom = null;
+
+            switch (geomInfo.type) {
+                case "box":
+                    geom = physics.createBoxGeom(
+                            geomInfo.lx * physicsScale,
+                            geomInfo.ly * physicsScale,
+                            geomInfo.lz * physicsScale
+                    );
+                    break;
+
+                case "sphere":
+                    geom = physics.createSphereGeom(geomInfo.radius * physicsScale);
+                    break;
+
+                case "cylinder":
+                    geom = physics.createCylinderGeom(
+                            geomInfo.radius * physicsScale,
+                            geomInfo.height * physicsScale
+                    );
+                    break;
+
+                default:
+                    float radius = estimateLinkRadius(link);
+                    geom = physics.createSphereGeom(radius * physicsScale);
+                    break;
+            }
+
+            return geom;
+
+        } catch (Exception e) {
+            logger.error("Failed to create geom for {}", link.name, e);
+            return null;
+        }
+    }
+
+    // ========================================================================
+    // 질량 설정
+    // ========================================================================
+
+    private GeometryInfo setDefaultMass(Object body, URDFLink link) {
+        GeometryInfo geomInfo = new GeometryInfo("sphere");
+        geomInfo.radius = 0.1;
+
         try {
             Object mass = createMassMethod.invoke(null);
-
-            // 기본 밀도 (kg/m^3 정도 느낌으로, 대충)
             double density = 500.0;
 
-            // 기본 사이즈 (URDF 단위, physicsScale 적용)
             double lx = 0.1, ly = 0.1, lz = 0.1;
 
             if (link != null && link.visual != null && link.visual.geometry != null) {
@@ -420,41 +477,54 @@ public final class URDFSimpleController {
                 switch (geom.type) {
                     case BOX:
                         if (geom.boxSize != null) {
-                            lx = Math.max(0.05, Math.abs(geom.boxSize.x * physicsScale));
-                            ly = Math.max(0.05, Math.abs(geom.boxSize.y * physicsScale));
-                            lz = Math.max(0.05, Math.abs(geom.boxSize.z * physicsScale));
+                            lx = Math.max(0.05, Math.abs(geom.boxSize.x));
+                            ly = Math.max(0.05, Math.abs(geom.boxSize.y));
+                            lz = Math.max(0.05, Math.abs(geom.boxSize.z));
+
+                            geomInfo.type = "box";
+                            geomInfo.lx = lx;
+                            geomInfo.ly = ly;
+                            geomInfo.lz = lz;
                         }
                         break;
+
                     case SPHERE:
                         if (geom.sphereRadius > 0) {
-                            double r = Math.max(0.03, Math.abs(geom.sphereRadius * physicsScale));
-                            // 스피어는 setSphere 사용 (가능하면)
+                            double r = Math.max(0.03, Math.abs(geom.sphereRadius));
+
+                            geomInfo.type = "sphere";
+                            geomInfo.radius = r;
+
                             if (massSetSphereMethod != null) {
-                                // density, radius
-                                massSetSphereMethod.invoke(mass, density, r);
+                                massSetSphereMethod.invoke(mass, density, r * physicsScale);
                                 applyMassToBody(body, mass);
-                                return;
+                                return geomInfo;
                             } else {
                                 lx = ly = lz = r * 2.0;
                             }
                         }
                         break;
+
                     case CYLINDER:
                         if (geom.cylinderRadius > 0 && geom.cylinderLength > 0) {
-                            double r = Math.max(0.03, Math.abs(geom.cylinderRadius * physicsScale));
-                            double h = Math.max(0.05, Math.abs(geom.cylinderLength * physicsScale));
-                            // 대략적인 상자로 근사
+                            double r = Math.max(0.03, Math.abs(geom.cylinderRadius));
+                            double h = Math.max(0.05, Math.abs(geom.cylinderLength));
+
+                            geomInfo.type = "cylinder";
+                            geomInfo.radius = r;
+                            geomInfo.height = h;
+
                             lx = ly = r * 2.0;
                             lz = h;
                         }
                         break;
+
                     case MESH:
-                        // 메시일 때는 스케일 정보로 대략적인 크기를 추정
                         if (geom.scale != null) {
                             double s = Math.max(
                                     Math.max(Math.abs(geom.scale.x), Math.abs(geom.scale.y)),
                                     Math.abs(geom.scale.z)
-                            ) * physicsScale;
+                            );
                             s = Math.max(0.05, s);
                             lx = ly = lz = s * 0.5;
                         }
@@ -462,24 +532,24 @@ public final class URDFSimpleController {
                 }
             }
 
-            // 박스 질량/관성 설정
             if (massSetBoxMethod != null) {
-                massSetBoxMethod.invoke(mass, density, lx, ly, lz);
+                massSetBoxMethod.invoke(mass,
+                        density,
+                        lx * physicsScale,
+                        ly * physicsScale,
+                        lz * physicsScale);
             } else if (massSetSphereMethod != null) {
-                // 박스를 못 쓰면 구로라도
                 double r = Math.max(0.05, Math.max(lx, Math.max(ly, lz)) * 0.5);
-                massSetSphereMethod.invoke(mass, density, r);
+                massSetSphereMethod.invoke(mass, density, r * physicsScale);
             } else {
-                // 최후의 fallback: adjust 로만 질량 맞추기 (형태 정보 없음)
                 double fallbackMass = 1.0;
                 setMassValue(mass, fallbackMass);
             }
 
-            // 만약 URDF에서 유효한 mass 값이 있다면, 전체 질량만 스케일 조정
             if (link != null && link.inertial != null && link.inertial.mass != null) {
                 float mv = link.inertial.mass.value;
                 if (mv > 0 && Float.isFinite(mv)) {
-                    setMassValue(mass, (double) mv);
+                    setMassValue(mass, mv);
                 }
             }
 
@@ -488,6 +558,8 @@ public final class URDFSimpleController {
         } catch (Exception e) {
             logger.warn("Failed to set mass for {}", link != null ? link.name : "unknown", e);
         }
+
+        return geomInfo;
     }
 
     private void setMassValue(Object mass, double value) {
@@ -509,7 +581,6 @@ public final class URDFSimpleController {
             return;
         }
 
-        // 0.5.x fallback
         try {
             for (Method m : body.getClass().getMethods()) {
                 if (m.getName().equals("setMass") && m.getParameterCount() == 1) {
@@ -531,7 +602,7 @@ public final class URDFSimpleController {
     private Object createODEJoint(URDFJoint joint, Object world) {
         try {
             Object parentBody = bodies.get(joint.parentLinkName);
-            Object childBody = bodies.get(joint.childLinkName);
+            Object childBody  = bodies.get(joint.childLinkName);
 
             if (parentBody == null && childBody == null) {
                 return null;
@@ -556,27 +627,26 @@ public final class URDFSimpleController {
 
     private Object createHingeJoint(URDFJoint joint, Object world,
                                     Object parentBody, Object childBody) throws Exception {
-        // *** FIXED: DJointGroup 파라미터 추가 ***
-        Method createHinge = odeHelperClass.getMethod("createHingeJoint",
-                dWorldClass, dJointGroupClass);
+        Method createHinge = odeHelperClass.getMethod(
+                "createHingeJoint", dWorldClass, dJointGroupClass);
         Object odeJoint = createHinge.invoke(null, world, null);
 
         Method attach = dHingeJointClass.getMethod("attach", dBodyClass, dBodyClass);
         attach.invoke(odeJoint, childBody, parentBody);
 
         double[] axis = getJointAxis(joint);
-        Method setAxis = dHingeJointClass.getMethod("setAxis",
-                double.class, double.class, double.class);
+        Method setAxis = dHingeJointClass.getMethod(
+                "setAxis", double.class, double.class, double.class);
         setAxis.invoke(odeJoint, axis[0], axis[1], axis[2]);
 
         if (joint.origin != null) {
             try {
-                Method setAnchor = dHingeJointClass.getMethod("setAnchor",
-                        double.class, double.class, double.class);
+                Method setAnchor = dHingeJointClass.getMethod(
+                        "setAnchor", double.class, double.class, double.class);
                 setAnchor.invoke(odeJoint,
-                        (double) joint.origin.xyz.x * physicsScale,
-                        (double) joint.origin.xyz.y * physicsScale,
-                        (double) joint.origin.xyz.z * physicsScale);
+                        joint.origin.xyz.x * physicsScale,
+                        joint.origin.xyz.y * physicsScale,
+                        joint.origin.xyz.z * physicsScale);
             } catch (Exception e) { }
         }
 
@@ -599,17 +669,16 @@ public final class URDFSimpleController {
 
     private Object createSliderJoint(URDFJoint joint, Object world,
                                      Object parentBody, Object childBody) throws Exception {
-        // *** FIXED: DJointGroup 파라미터 추가 ***
-        Method createSlider = odeHelperClass.getMethod("createSliderJoint",
-                dWorldClass, dJointGroupClass);
+        Method createSlider = odeHelperClass.getMethod(
+                "createSliderJoint", dWorldClass, dJointGroupClass);
         Object odeJoint = createSlider.invoke(null, world, null);
 
         Method attach = dSliderJointClass.getMethod("attach", dBodyClass, dBodyClass);
         attach.invoke(odeJoint, childBody, parentBody);
 
         double[] axis = getJointAxis(joint);
-        Method setAxis = dSliderJointClass.getMethod("setAxis",
-                double.class, double.class, double.class);
+        Method setAxis = dSliderJointClass.getMethod(
+                "setAxis", double.class, double.class, double.class);
         setAxis.invoke(odeJoint, axis[0], axis[1], axis[2]);
 
         return odeJoint;
@@ -617,9 +686,8 @@ public final class URDFSimpleController {
 
     private Object createFixedJoint(URDFJoint joint, Object world,
                                     Object parentBody, Object childBody) throws Exception {
-        // *** FIXED: DJointGroup 파라미터 추가 ***
-        Method createFixed = odeHelperClass.getMethod("createFixedJoint",
-                dWorldClass, dJointGroupClass);
+        Method createFixed = odeHelperClass.getMethod(
+                "createFixedJoint", dWorldClass, dJointGroupClass);
         Object odeJoint = createFixed.invoke(null, world, null);
 
         Method attach = dFixedJointClass.getMethod("attach", dBodyClass, dBodyClass);
@@ -794,17 +862,10 @@ public final class URDFSimpleController {
     // 루트 링크 위치 (렌더러용)
     // ========================================================================
 
-    /**
-     * 루트 링크의 물리 위치 반환 (엔티티 로컬 좌표)
-     * 렌더러에서 로봇 전체 위치/자세 결정에 사용
-     */
     public float[] getRootLinkLocalPosition() {
         if (!usePhysics) return new float[]{0, 0, 0};
-
-        // 루트 링크는 body가 없으므로, 첫 번째 자식 링크의 위치 사용
         if (bodies.isEmpty()) return new float[]{0, 0, 0};
 
-        // 간단히 첫 번째 바디 위치 반환
         Object firstBody = bodies.values().iterator().next();
         if (firstBody != null && physics != null) {
             double[] pos = physics.getBodyPosition(firstBody);
@@ -814,9 +875,6 @@ public final class URDFSimpleController {
         return new float[]{0, 0, 0};
     }
 
-    /**
-     * 특정 링크의 월드 위치 반환 (마인크래프트 절대 좌표)
-     */
     public float[] getLinkWorldPosition(String linkName) {
         if (!usePhysics) {
             return new float[]{
@@ -840,6 +898,78 @@ public final class URDFSimpleController {
                 (float) worldPosition.x,
                 (float) worldPosition.y,
                 (float) worldPosition.z
+        };
+    }
+
+    // ========================================================================
+    // 베이스(발바닥) 높이 & 루트 바디 월드 위치 (RL/렌더러용)
+    // ========================================================================
+
+    /**
+     * 로봇에서 가장 낮은 바디의 "바닥면" 높이를 월드 좌표계 Y로 반환.
+     *
+     * - 발이 지면에 닿아 있으면 ≈ 0 근처
+     * - 로봇이 떠 있으면 > 0
+     * - 지면 아래로 파고들면 < 0
+     */
+    public float getApproxBaseHeightWorldY() {
+        if (!usePhysics || !physicsInitialized || bodies.isEmpty() || physics == null) {
+            // 물리 안 쓰는 경우에는 엔티티 기준 위치를 그대로 사용
+            return (float) worldPosition.y;
+        }
+
+        double minBottomLocalY = Double.POSITIVE_INFINITY;
+
+        for (Map.Entry<String, Object> entry : bodies.entrySet()) {
+            Object body = entry.getValue();
+            if (body == null) continue;
+
+            double[] pos = physics.getBodyPosition(body);
+            if (pos == null || pos.length < 2) continue;
+
+            // linkRadii는 URDF 단위로 저장되어 있으므로 physicsScale까지 곱해 물리 단위로 맞춘다
+            float radius = getLinkRadius(entry.getKey());
+            double bottomY = pos[1] - radius; // 바디 중심 Y - 반경
+
+            if (bottomY < minBottomLocalY) {
+                minBottomLocalY = bottomY;
+            }
+        }
+
+        if (!Double.isFinite(minBottomLocalY)) {
+            // 실패 시: 첫 번째 바디 중심으로 fallback
+            Object firstBody = bodies.values().iterator().next();
+            double[] pos = physics.getBodyPosition(firstBody);
+            if (pos == null || pos.length < 2) {
+                return (float) worldPosition.y;
+            }
+            minBottomLocalY = pos[1];
+        }
+
+        // ODE 로컬(Y) + 엔티티 월드 Y → 절대 월드 Y
+        double worldY = worldPosition.y + minBottomLocalY;
+        return (float) worldY;
+    }
+
+    /**
+     * "루트"로 사용할 대표 바디의 월드 위치를 반환.
+     * 현재 구조상 별도의 루트 바디가 없어서, 첫 번째 동적 바디를 대표로 사용.
+     */
+    public double[] getRootBodyWorldPosition() {
+        if (!usePhysics || !physicsInitialized || bodies.isEmpty() || physics == null) {
+            return new double[]{worldPosition.x, worldPosition.y, worldPosition.z};
+        }
+
+        Object firstBody = bodies.values().iterator().next();
+        double[] localPos = physics.getBodyPosition(firstBody);
+        if (localPos == null || localPos.length < 3) {
+            return new double[]{worldPosition.x, worldPosition.y, worldPosition.z};
+        }
+
+        return new double[]{
+                worldPosition.x + localPos[0],
+                worldPosition.y + localPos[1],
+                worldPosition.z + localPos[2]
         };
     }
 
@@ -933,7 +1063,7 @@ public final class URDFSimpleController {
             value = Mth.clamp(value, j.limit.lower, j.limit.upper);
         }
         j.currentPosition = value;
-        target.put(name, value);
+        target.put(j.name, value);
     }
 
     public boolean isUsingPhysics() {
@@ -943,8 +1073,8 @@ public final class URDFSimpleController {
     public void setGains(float kp, float kd) {
         this.kp = kp;
         this.kd = kd;
-        this.physicsKp = kp * 15f;
-        this.physicsKd = kd * 8f;
+        this.physicsKp = kp * 5f;  // 예전보다 스케일 낮게
+        this.physicsKd = kd * 3f;
     }
 
     public void setLimits(float maxVel, float maxAcc) {
@@ -999,6 +1129,7 @@ public final class URDFSimpleController {
         }
 
         bodies.clear();
+        geoms.clear();
         odeJoints.clear();
         linkRadii.clear();
         physicsInitialized = false;
@@ -1014,7 +1145,6 @@ public final class URDFSimpleController {
             targetVelocities.put(j.name, 0f);
         }
 
-        // 바디 위치/속도 리셋
         for (Object body : bodies.values()) {
             if (body != null && physics != null) {
                 physics.setBodyLinearVel(body, 0, 0, 0);
@@ -1028,6 +1158,18 @@ public final class URDFSimpleController {
     // ========================================================================
     // 유틸리티
     // ========================================================================
+
+    /**
+     * linkRadii에 저장된 반경(URDF 단위)을 physicsScale까지 곱해
+     * 물리 월드(ODE) 단위의 반경으로 반환.
+     */
+    private float getLinkRadius(String linkName) {
+        Float r = linkRadii.get(linkName);
+        if (r == null || r <= 0f || !Float.isFinite(r)) {
+            r = 0.1f;
+        }
+        return r * physicsScale;
+    }
 
     private boolean isFixedLink(URDFLink link) {
         if ("world".equals(link.name)) return true;
