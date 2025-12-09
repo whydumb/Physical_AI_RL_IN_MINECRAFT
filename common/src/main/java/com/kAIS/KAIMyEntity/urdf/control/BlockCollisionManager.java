@@ -4,12 +4,9 @@ import com.kAIS.KAIMyEntity.PhysicsManager;
 import net.minecraft.core.BlockPos;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.state.BlockState;
-import net.minecraft.world.phys.AABB;
-import net.minecraft.world.phys.Vec3;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
-import java.lang.reflect.Method;
 import java.util.*;
 
 /**
@@ -19,7 +16,7 @@ import java.util.*;
  * - 엔티티 주변 블록을 ODE4J static geometry로 변환
  * - 동적으로 충돌 영역 업데이트 (성능 최적화)
  * - 범위 밖 블록 자동 제거
- * - Body-Block 직접 충돌 검사 (ODE4J Geom 없이도 동작)
+ * - ODE4J의 space.collide가 자동으로 충돌 처리
  */
 public class BlockCollisionManager {
     private static final Logger logger = LogManager.getLogger();
@@ -27,7 +24,6 @@ public class BlockCollisionManager {
     private final PhysicsManager physics;
     private final Map<BlockPos, Object> blockGeoms = new HashMap<>();
 
-    // 더 이상 ODE4J space 를 직접 만들지 않음 (PhysicsManager.space만 사용)
     private boolean odeGeomSupported = false;
 
     // 설정
@@ -38,15 +34,9 @@ public class BlockCollisionManager {
     // 마인크래프트 1블록 = ODE4J 1미터
     private static final double BLOCK_SIZE = 1.0;
 
-    // 충돌 응답 설정
-    private double bounciness = 0.3;           // 반발 계수
-    private double friction = 0.8;             // 마찰 계수
-    private double penetrationCorrection = 0.8; // 관통 보정 강도
-
     // 통계
     private int totalBlocksCreated = 0;
     private int totalBlocksRemoved = 0;
-    private int collisionsThisTick = 0;
 
     // 캐시된 블록 정보 (매 틱 재스캔 방지)
     private BlockPos lastCenterPos = null;
@@ -56,30 +46,30 @@ public class BlockCollisionManager {
         this.physics = PhysicsManager.GetInst();
 
         if (physics == null || !physics.isInitialized()) {
-            logger.warn("PhysicsManager not available - using fallback collision mode");
+            logger.warn("PhysicsManager not available - block collision disabled");
             odeGeomSupported = false;
         } else {
-            odeGeomSupported = true; // PhysicsManager.space 사용
+            odeGeomSupported = true;
         }
 
         logger.info(
-            "BlockCollisionManager created (scan radius: {}, update interval: {}, ODE geom: {})",
-            scanRadius, updateInterval, odeGeomSupported ? "supported" : "fallback"
+                "BlockCollisionManager created (scan radius: {}, update interval: {}, ODE geom: {})",
+                scanRadius, updateInterval, odeGeomSupported ? "supported" : "disabled"
         );
     }
 
     /**
      * 엔티티 주변 블록 충돌 업데이트 (메인 업데이트 메서드)
+     * static ODE geom만 관리, 실제 충돌은 physics.step 내부에서 처리됨
      */
     public void updateCollisionArea(Level level, double entityX, double entityY, double entityZ) {
-        if (level == null) return;
+        if (level == null || !odeGeomSupported) return;
 
         tickCounter++;
         if (tickCounter < updateInterval) {
             return;
         }
         tickCounter = 0;
-        collisionsThisTick = 0;
 
         BlockPos centerPos = BlockPos.containing(entityX, entityY, entityZ);
 
@@ -111,7 +101,7 @@ public class BlockCollisionManager {
                         BlockPos immutablePos = pos.immutable();
                         currentBlocks.add(immutablePos);
 
-                        if (!blockGeoms.containsKey(immutablePos) && odeGeomSupported) {
+                        if (!blockGeoms.containsKey(immutablePos)) {
                             createBlockGeom(immutablePos, state);
                         }
                     }
@@ -139,8 +129,8 @@ public class BlockCollisionManager {
                 for (int z = -scanRadius; z <= scanRadius; z++) {
                     // 경계 근처만 체크 (최적화)
                     if (Math.abs(x) < scanRadius - 1 &&
-                        Math.abs(y) < scanRadius - 1 &&
-                        Math.abs(z) < scanRadius - 1) {
+                            Math.abs(y) < scanRadius - 1 &&
+                            Math.abs(z) < scanRadius - 1) {
                         continue;
                     }
 
@@ -163,7 +153,7 @@ public class BlockCollisionManager {
         // 적용
         for (BlockPos pos : toAdd) {
             cachedSolidBlocks.add(pos);
-            if (odeGeomSupported && !blockGeoms.containsKey(pos)) {
+            if (!blockGeoms.containsKey(pos)) {
                 createBlockGeom(pos, level.getBlockState(pos));
             }
         }
@@ -207,6 +197,7 @@ public class BlockCollisionManager {
 
     /**
      * PhysicsManager.space 안에 ODE4J Box Geometry 생성
+     * ODE의 space.collide가 자동으로 이 geom을 인식함
      */
     private void createBlockGeom(BlockPos pos, BlockState state) {
         if (!odeGeomSupported || physics == null) return;
@@ -221,11 +212,14 @@ public class BlockCollisionManager {
 
             // 위치 설정 (블록 중심)
             physics.setGeomPosition(
-                geom,
-                pos.getX() + 0.5,
-                pos.getY() + 0.5,
-                pos.getZ() + 0.5
+                    geom,
+                    pos.getX() + 0.5,
+                    pos.getY() + 0.5,
+                    pos.getZ() + 0.5
             );
+
+            // ★ 추가: 정적 geom으로 등록
+            physics.registerStaticGeom(geom);
 
             blockGeoms.put(pos, geom);
             totalBlocksCreated++;
@@ -249,218 +243,6 @@ public class BlockCollisionManager {
         }
     }
 
-    // ========== 직접 충돌 검사 API (ODE4J Geom 없이도 사용 가능) ==========
-
-    /**
-     * Body와 주변 블록 충돌 검사 및 응답 적용
-     * HybridJointController에서 호출
-     *
-     * @param body      ODE4J Body 객체
-     * @param worldPos  엔티티의 월드 좌표
-     * @param level     월드
-     * @param bodyRadius Body의 대략적인 반경 (충돌 검사용)
-     */
-    public void handleBodyBlockCollision(Object body, Vec3 worldPos, Level level, double bodyRadius) {
-        if (body == null || level == null) return;
-
-        try {
-            // Body 위치 가져오기
-            double[] bodyPos = physics != null ? physics.getBodyPosition(body) : null;
-            if (bodyPos == null) return;
-
-            Vec3 absolutePos = worldPos.add(bodyPos[0], bodyPos[1], bodyPos[2]);
-
-            // Body AABB 계산
-            AABB bodyAABB = new AABB(
-                absolutePos.x - bodyRadius, absolutePos.y - bodyRadius, absolutePos.z - bodyRadius,
-                absolutePos.x + bodyRadius, absolutePos.y + bodyRadius, absolutePos.z + bodyRadius
-            );
-
-            // 주변 블록과 충돌 검사
-            BlockPos minPos = BlockPos.containing(bodyAABB.minX - 1, bodyAABB.minY - 1, bodyAABB.minZ - 1);
-            BlockPos maxPos = BlockPos.containing(bodyAABB.maxX + 1, bodyAABB.maxY + 1, bodyAABB.maxZ + 1);
-
-            for (BlockPos pos : BlockPos.betweenClosed(minPos, maxPos)) {
-                BlockState state = level.getBlockState(pos);
-
-                if (!isSolidForCollision(state)) continue;
-
-                // 블록 AABB
-                AABB blockAABB = new AABB(
-                    pos.getX(), pos.getY(), pos.getZ(),
-                    pos.getX() + 1, pos.getY() + 1, pos.getZ() + 1
-                );
-
-                // AABB 충돌 검사
-                if (bodyAABB.intersects(blockAABB)) {
-                    resolveCollision(body, absolutePos, bodyRadius, blockAABB, pos);
-                    collisionsThisTick++;
-                }
-            }
-
-        } catch (Exception e) {
-            logger.debug("Body-block collision check failed: {}", e.getMessage());
-        }
-    }
-
-    /**
-     * 충돌 해결 (위치 보정 + 속도 반영)
-     */
-    private void resolveCollision(Object body, Vec3 bodyPos, double bodyRadius,
-                                  AABB blockAABB, BlockPos blockPos) {
-        try {
-            // 침투 깊이와 방향 계산
-            Vec3 blockCenter = new Vec3(
-                blockAABB.minX + 0.5,
-                blockAABB.minY + 0.5,
-                blockAABB.minZ + 0.5
-            );
-
-            Vec3 toBody = bodyPos.subtract(blockCenter);
-
-            // 가장 가까운 면 찾기
-            double overlapX = (0.5 + bodyRadius) - Math.abs(toBody.x);
-            double overlapY = (0.5 + bodyRadius) - Math.abs(toBody.y);
-            double overlapZ = (0.5 + bodyRadius) - Math.abs(toBody.z);
-
-            if (overlapX <= 0 || overlapY <= 0 || overlapZ <= 0) return;
-
-            // 최소 침투 축 선택
-            Vec3 normal;
-            double penetration;
-
-            if (overlapX < overlapY && overlapX < overlapZ) {
-                normal = new Vec3(Math.signum(toBody.x), 0, 0);
-                penetration = overlapX;
-            } else if (overlapY < overlapZ) {
-                normal = new Vec3(0, Math.signum(toBody.y), 0);
-                penetration = overlapY;
-            } else {
-                normal = new Vec3(0, 0, Math.signum(toBody.z));
-                penetration = overlapZ;
-            }
-
-            // 1. 위치 보정
-            applyPositionCorrection(body, normal, penetration);
-
-            // 2. 속도 반영 (반발 + 마찰)
-            applyVelocityResponse(body, normal);
-
-        } catch (Exception e) {
-            logger.debug("Collision resolution failed: {}", e.getMessage());
-        }
-    }
-
-    /**
-     * 위치 보정 적용
-     */
-    private void applyPositionCorrection(Object body, Vec3 normal, double penetration) {
-        if (physics == null) return;
-
-        try {
-            double[] currentPos = physics.getBodyPosition(body);
-            if (currentPos == null) return;
-
-            double correction = penetration * penetrationCorrection;
-
-            Method setPosition = body.getClass().getMethod(
-                "setPosition",
-                double.class, double.class, double.class
-            );
-
-            setPosition.invoke(
-                body,
-                currentPos[0] + normal.x * correction,
-                currentPos[1] + normal.y * correction,
-                currentPos[2] + normal.z * correction
-            );
-
-        } catch (Exception e) {
-            logger.debug("Position correction failed: {}", e.getMessage());
-        }
-    }
-
-    /**
-     * 속도 응답 적용 (반발 + 마찰)
-     */
-    private void applyVelocityResponse(Object body, Vec3 normal) {
-        if (physics == null) return;
-
-        try {
-            double[] vel = physics.getBodyLinearVel(body);
-            if (vel == null) return;
-
-            Vec3 velocity = new Vec3(vel[0], vel[1], vel[2]);
-
-            // 법선 방향 속도 성분
-            double normalSpeed = velocity.dot(normal);
-
-            // 블록을 향해 이동 중일 때만 반발
-            if (normalSpeed < 0) {
-                // 법선 방향 속도 분해
-                Vec3 normalVel = normal.scale(normalSpeed);
-                Vec3 tangentVel = velocity.subtract(normalVel);
-
-                // 새 속도 = 반발된 법선 속도 + 마찰 적용된 접선 속도
-                Vec3 newNormalVel = normal.scale(-normalSpeed * bounciness);
-                Vec3 newTangentVel = tangentVel.scale(1.0 - friction * 0.1); // 약한 마찰
-
-                Vec3 newVel = newNormalVel.add(newTangentVel);
-
-                Method setLinearVel = body.getClass().getMethod(
-                    "setLinearVel",
-                    double.class, double.class, double.class
-                );
-                setLinearVel.invoke(body, newVel.x, newVel.y, newVel.z);
-            }
-
-        } catch (Exception e) {
-            logger.debug("Velocity response failed: {}", e.getMessage());
-        }
-    }
-
-    /**
-     * 간단한 바닥 충돌 검사 (Y축만)
-     * 빠른 지면 체크용
-     */
-    public double getGroundHeight(Level level, double x, double z, double startY) {
-        if (level == null) return startY;
-
-        BlockPos.MutableBlockPos checkPos = new BlockPos.MutableBlockPos();
-
-        for (int y = (int) startY; y >= startY - scanRadius && y >= level.getMinBuildHeight(); y--) {
-            checkPos.set((int) Math.floor(x), y, (int) Math.floor(z));
-            BlockState state = level.getBlockState(checkPos);
-
-            if (isSolidForCollision(state)) {
-                return y + 1.0; // 블록 위쪽 면
-            }
-        }
-
-        return level.getMinBuildHeight();
-    }
-
-    /**
-     * 레이캐스트 (특정 방향으로 블록 검사)
-     */
-    public Optional<BlockPos> raycastToBlock(Level level, Vec3 start, Vec3 direction, double maxDistance) {
-        if (level == null) return Optional.empty();
-
-        Vec3 normalizedDir = direction.normalize();
-        double step = 0.25; // 정밀도
-
-        for (double d = 0; d < maxDistance; d += step) {
-            Vec3 point = start.add(normalizedDir.scale(d));
-            BlockPos pos = BlockPos.containing(point);
-
-            if (isSolidForCollision(level.getBlockState(pos))) {
-                return Optional.of(pos);
-            }
-        }
-
-        return Optional.empty();
-    }
-
     // ========== 정리 ==========
 
     public void cleanup() {
@@ -472,8 +254,8 @@ public class BlockCollisionManager {
         blockGeoms.clear();
         cachedSolidBlocks.clear();
 
-        // 더 이상 space 직접 destroy 안 함 (PhysicsManager가 책임짐)
-        logger.info("BlockCollisionManager cleaned up");
+        logger.info("BlockCollisionManager cleaned up (created: {}, removed: {})",
+                totalBlocksCreated, totalBlocksRemoved);
     }
 
     // ========== 설정 ==========
@@ -486,14 +268,6 @@ public class BlockCollisionManager {
         this.updateInterval = Math.max(1, Math.min(ticks, 20));
     }
 
-    public void setBounciness(double bounce) {
-        this.bounciness = Math.max(0, Math.min(bounce, 1.0));
-    }
-
-    public void setFriction(double fric) {
-        this.friction = Math.max(0, Math.min(fric, 1.0));
-    }
-
     public void forceUpdate(Level level, double entityX, double entityY, double entityZ) {
         tickCounter = updateInterval;
         lastCenterPos = null; // 캐시 무효화
@@ -503,11 +277,7 @@ public class BlockCollisionManager {
     // ========== 정보 조회 ==========
 
     public int getActiveBlockCount() {
-        return odeGeomSupported ? blockGeoms.size() : cachedSolidBlocks.size();
-    }
-
-    public int getCollisionsThisTick() {
-        return collisionsThisTick;
+        return blockGeoms.size();
     }
 
     public boolean isOdeGeomSupported() {
@@ -535,11 +305,8 @@ public class BlockCollisionManager {
         info.put("odeGeomSupported", odeGeomSupported);
         info.put("scanRadius", scanRadius);
         info.put("updateInterval", updateInterval);
-        info.put("collisionsThisTick", collisionsThisTick);
         info.put("totalCreated", totalBlocksCreated);
         info.put("totalRemoved", totalBlocksRemoved);
-        info.put("bounciness", bounciness);
-        info.put("friction", friction);
         return info;
     }
 }
