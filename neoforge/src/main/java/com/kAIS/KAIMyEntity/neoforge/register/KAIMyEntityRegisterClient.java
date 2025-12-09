@@ -3,12 +3,9 @@ package com.kAIS.KAIMyEntity.neoforge.register;
 import com.kAIS.KAIMyEntity.renderer.KAIMyEntityRendererPlayerHelper;
 import com.kAIS.KAIMyEntity.renderer.MMDModelManager;
 
-// URDF 쪽
 import com.kAIS.KAIMyEntity.neoforge.ClientTickLoop;
 import com.kAIS.KAIMyEntity.urdf.URDFModelOpenGLWithSTL;
 import com.kAIS.KAIMyEntity.urdf.control.MotionEditorScreen;
-import com.kAIS.KAIMyEntity.webots.WebotsController;
-import com.kAIS.KAIMyEntity.webots.WebotsConfigScreen;
 
 import com.mojang.blaze3d.platform.InputConstants;
 import net.minecraft.client.Minecraft;
@@ -40,12 +37,8 @@ import java.util.Objects;
  * - V/B/N/M: 기존 커스텀 애니메이션
  * - G: RL Control 패널 열기 (없으면 URDF 자동 로드 시도)
  *   - Ctrl + G: URDF 모델 리로드
- * - H: URDF 물리 리셋
- * - T: Webots 통계 출력
- * - Y: Webots T-Pose 테스트
- * - U: Webots 설정 GUI
  *
- * VMD 관련(키, GUI, 로더)은 전부 제거됨.
+ * Webots 관련 키/로직(T, Y, U 등)은 모두 제거됨.
  */
 @EventBusSubscriber(modid = "kaimyentity", bus = EventBusSubscriber.Bus.MOD, value = Dist.CLIENT)
 public class KAIMyEntityRegisterClient {
@@ -57,10 +50,7 @@ public class KAIMyEntityRegisterClient {
     static KeyMapping keyCustomAnim3       = new KeyMapping("key.customAnim3",       KeyConflictContext.IN_GAME, KeyModifier.NONE, InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_N, "key.title");
     static KeyMapping keyCustomAnim4       = new KeyMapping("key.customAnim4",       KeyConflictContext.IN_GAME, KeyModifier.NONE, InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_M, "key.title");
     static KeyMapping keyMotionGuiOrReload = new KeyMapping("key.motionGuiOrReload", KeyConflictContext.IN_GAME, KeyModifier.NONE, InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_G, "key.title");
-    static KeyMapping keyResetPhysics      = new KeyMapping("key.resetPhysics",      KeyConflictContext.IN_GAME, KeyModifier.NONE, InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_H, "key.title");
-    static KeyMapping keyWebotsStats       = new KeyMapping("key.webotsStats",       KeyConflictContext.IN_GAME, KeyModifier.NONE, InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_T, "key.title");
-    static KeyMapping keyWebotsTest        = new KeyMapping("key.webotsTest",        KeyConflictContext.IN_GAME, KeyModifier.NONE, InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_Y, "key.title");
-    static KeyMapping keyWebotsConfig      = new KeyMapping("key.webotsConfig",      KeyConflictContext.IN_GAME, KeyModifier.NONE, InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_U, "key.title");
+
 
     // === 키맵 등록 (MOD BUS 이벤트) ===
     @SubscribeEvent
@@ -70,10 +60,7 @@ public class KAIMyEntityRegisterClient {
         e.register(keyCustomAnim3);
         e.register(keyCustomAnim4);
         e.register(keyMotionGuiOrReload);
-        e.register(keyResetPhysics);
-        e.register(keyWebotsStats);
-        e.register(keyWebotsTest);
-        e.register(keyWebotsConfig);
+
         logger.info("KAIMyEntityRegisterClient: key mappings registered.");
     }
 
@@ -102,7 +89,7 @@ class KAIMyEntityKeyHandler {
         if (KAIMyEntityRegisterClient.keyMotionGuiOrReload.consumeClick()) {
             long win = MC.getWindow().getWindow();
             boolean ctrl = GLFW.glfwGetKey(win, GLFW.GLFW_KEY_LEFT_CONTROL) == GLFW.GLFW_PRESS
-                        || GLFW.glfwGetKey(win, GLFW.GLFW_KEY_RIGHT_CONTROL) == GLFW.GLFW_PRESS;
+                    || GLFW.glfwGetKey(win, GLFW.GLFW_KEY_RIGHT_CONTROL) == GLFW.GLFW_PRESS;
 
             if (ctrl) {
                 // URDF 모델 리로드
@@ -115,7 +102,9 @@ class KAIMyEntityKeyHandler {
                 ensureActiveRenderer(MC);
             } else {
                 // RL 패널 열기
-                if (ClientTickLoop.renderer == null) ensureActiveRenderer(MC);
+                if (ClientTickLoop.renderer == null) {
+                    ensureActiveRenderer(MC);
+                }
                 if (ClientTickLoop.renderer != null) {
                     MotionEditorScreen.open(ClientTickLoop.renderer);
                 } else {
@@ -124,36 +113,6 @@ class KAIMyEntityKeyHandler {
             }
         }
 
-        // ==== H: 물리 리셋 ====
-        if (KAIMyEntityRegisterClient.keyResetPhysics.consumeClick()) {
-            var m = MMDModelManager.GetModel("EntityPlayer_" + player.getName().getString());
-            if (m != null) {
-                KAIMyEntityRendererPlayerHelper.ResetPhysics(player);
-                net.neoforged.neoforge.network.PacketDistributor.sendToServer(
-                        new com.kAIS.KAIMyEntity.neoforge.network.KAIMyEntityNetworkPack(2, player.getGameProfile(), 0));
-                MC.gui.getChat().addMessage(Component.literal("URDF physics reset"));
-            }
-        }
-
-        // ==== T: Webots 통계 출력 ====
-        if (KAIMyEntityRegisterClient.keyWebotsStats.consumeClick()) {
-            try {
-                WebotsController.getInstance().printStats();
-                MC.gui.getChat().addMessage(Component.literal("§a[Webots] Stats printed to console"));
-            } catch (Exception e) {
-                MC.gui.getChat().addMessage(Component.literal("§c[Webots] Error: " + e.getMessage()));
-            }
-        }
-
-        // ==== Y: Webots 테스트 자세 ====
-        if (KAIMyEntityRegisterClient.keyWebotsTest.consumeClick()) {
-            testWebotsConnection(MC);
-        }
-
-        // ==== U: Webots 설정 GUI ====
-        if (KAIMyEntityRegisterClient.keyWebotsConfig.consumeClick()) {
-            MC.setScreen(new WebotsConfigScreen(MC.screen));
-        }
     }
 
     // === 커스텀 애니메이션 처리 ===
@@ -172,32 +131,13 @@ class KAIMyEntityKeyHandler {
                 new com.kAIS.KAIMyEntity.neoforge.network.KAIMyEntityNetworkPack(1, player.getGameProfile(), index));
     }
 
-    // === Webots 연결 테스트 (T-Pose) ===
-    private static void testWebotsConnection(Minecraft mc) {
-        try {
-            var webots = WebotsController.getInstance();
-
-            webots.setJoint("r_sho_pitch", 0.3f);
-            webots.setJoint("r_sho_roll", 1.57f);
-            webots.setJoint("r_el", -0.1f);
-
-            webots.setJoint("l_sho_pitch", 0.3f);
-            webots.setJoint("l_sho_roll", -1.57f);
-            webots.setJoint("l_el", -0.1f);
-
-            mc.gui.getChat().addMessage(Component.literal("§a[Webots] T-Pose sent!"));
-
-        } catch (Exception e) {
-            mc.gui.getChat().addMessage(Component.literal("§c[Webots] Connection failed: " + e.getMessage()));
-            logger.error("Webots test failed", e);
-        }
-    }
-
     // === 렌더러 자동 로드 ===
     private static void ensureActiveRenderer(Minecraft mc) {
         if (ClientTickLoop.renderer != null) return;
 
         File gameDir = mc.gameDirectory;
+        // ./KAIMyEntity, ./config 같은 하위 디렉토리를 우선적으로 찾는다면
+        // 여기에서 root를 조정해도 됨. 지금은 gameDir 기준 depth 2까지 검색.
         File urdf = findFirstUrdf(gameDir, 2);
         if (urdf == null) {
             mc.gui.getChat().addMessage(Component.literal("[URDF] No *.urdf found under ./KAIMyEntity or ./config"));
@@ -208,11 +148,13 @@ class KAIMyEntityKeyHandler {
             mc.gui.getChat().addMessage(Component.literal("[URDF] Guessing modelDir failed"));
             return;
         }
+
         URDFModelOpenGLWithSTL r = URDFModelOpenGLWithSTL.Create(urdf.getAbsolutePath(), modelDir.getAbsolutePath());
         if (r == null) {
             mc.gui.getChat().addMessage(Component.literal("[URDF] Parse failed: " + urdf.getAbsolutePath()));
             return;
         }
+
         ClientTickLoop.renderer = r;
         mc.gui.getChat().addMessage(Component.literal("[URDF] Active renderer set: " + urdf.getName()));
     }
@@ -221,9 +163,11 @@ class KAIMyEntityKeyHandler {
         if (root == null || !root.exists() || maxDepth < 0) return null;
         File[] list = root.listFiles();
         if (list == null) return null;
+        // 1차: 현재 디렉토리의 urdf
         for (File f : Objects.requireNonNull(list)) {
             if (f.isFile() && f.getName().toLowerCase().endsWith(".urdf")) return f;
         }
+        // 2차: 하위 디렉토리 재귀 검색
         for (File f : list) {
             if (f.isDirectory()) {
                 File r = findFirstUrdf(f, maxDepth - 1);
