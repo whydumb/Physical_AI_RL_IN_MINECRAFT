@@ -19,6 +19,7 @@ import org.joml.Vector3f;
 
 import java.io.File;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * URDF 모델 렌더링 + ODE4J 물리 통합 + 블록 충돌 연동 버전
@@ -34,14 +35,17 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
     private final Map<String, STLLoader.STLMesh> meshCache = new HashMap<>();
 
     // 렌더 전용 스케일 (물리는 1블록 = 1m 기준으로 동작)
-    private static final float GLOBAL_SCALE = 5.0f;
-
-    // 기본 루트 높이 + 지면 정렬용 오프셋
-    private static final float BASE_HEIGHT = 1.5f;
-    private float groundOffset = 0.0f;
+    // 물리 스케일과 맞추려면 1.0f, 시각적으로만 크게 보이고 싶으면 5.0f 등으로 조정
+    private static final float GLOBAL_SCALE = 1.0f;
 
     private static final boolean FLIP_NORMALS = true;
     private static final boolean DEBUG_MODE = false;
+
+    /**
+     * Manual joint locks are persistent by default. Set to a positive value to auto-release after the
+     * specified duration in milliseconds, or to 0 to disable locking while still stamping ownership.
+     */
+    private static final long MANUAL_LOCK_DURATION_MS = -1L;
 
     // ROS → Minecraft 좌표계 보정
     private static final Vector3f SRC_UP  = new Vector3f(0, 0, 1);
@@ -53,6 +57,56 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
     // VMD ↔ URDF 조인트 이름 매핑
     private final Map<String, String> jointNameMapping = new HashMap<>();
     private boolean jointMappingInitialized = false;
+
+    private final Map<String, JointControlState> jointControlStates = new ConcurrentHashMap<>();
+
+    /**
+     * Control source priorities. GUI manual control always wins until released.
+     */
+    public enum JointControlSource {
+        RL,
+        VMD,
+        GUI,
+        OTHER
+    }
+
+    private static final class JointControlState {
+        private boolean manualLocked = false;
+        private long manualLockExpiresAt = 0L;
+
+        boolean isManualLocked() {
+            if (!manualLocked) {
+                return false;
+            }
+            if (manualLockExpiresAt > 0 && System.currentTimeMillis() > manualLockExpiresAt) {
+                manualLocked = false;
+            }
+            return manualLocked;
+        }
+
+        void markManualLocked() {
+            manualLocked = true;
+            if (MANUAL_LOCK_DURATION_MS > 0) {
+                manualLockExpiresAt = System.currentTimeMillis() + MANUAL_LOCK_DURATION_MS;
+            } else if (MANUAL_LOCK_DURATION_MS == 0) {
+                manualLocked = false;
+                manualLockExpiresAt = 0L;
+            } else {
+                manualLockExpiresAt = -1L;
+            }
+        }
+
+        void clearManualLock() {
+            manualLocked = false;
+            manualLockExpiresAt = 0L;
+        }
+
+        void clearManualLockIfExpired() {
+            if (manualLocked && manualLockExpiresAt > 0 && System.currentTimeMillis() > manualLockExpiresAt) {
+                clearManualLock();
+            }
+        }
+    }
 
     // ========================================================================
     // 생성자 / 초기화
@@ -78,7 +132,8 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
         logger.info("=== URDF renderer Created (Scale: {}) ===", GLOBAL_SCALE);
 
         loadAllMeshes();
-        calculateGroundOffset();
+        // STL 기반 groundOffset 보정은 제거 (물리/렌더 좌표 일치시키기 위함)
+        // calculateGroundOffset();
     }
 
     /**
@@ -98,7 +153,7 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
                         if (mesh != null) {
                             // URDF 내 scale 적용
                             if (g.scale != null &&
-                                (g.scale.x != 1f || g.scale.y != 1f || g.scale.z != 1f)) {
+                                    (g.scale.x != 1f || g.scale.y != 1f || g.scale.z != 1f)) {
                                 STLLoader.scaleMesh(mesh, g.scale);
                             }
                             meshCache.put(link.name, mesh);
@@ -113,52 +168,9 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
                 loadedCount, robotModel.getLinkCount());
     }
 
-    /**
-     * 로봇의 발/최저점 기준으로 groundOffset 계산
-     */
-    private void calculateGroundOffset() {
-        float minZ = 0.0f;
-        boolean foundFootLink = false;
-
-        for (URDFLink link : robotModel.links) {
-            String lowerName = link.name.toLowerCase();
-            if (lowerName.contains("foot") || lowerName.contains("ankle") ||
-                lowerName.contains("toe")  || lowerName.contains("sole")) {
-
-                foundFootLink = true;
-
-                if (link.visual != null && link.visual.origin != null) {
-                    minZ = Math.min(minZ, link.visual.origin.xyz.z);
-                }
-
-                STLLoader.STLMesh mesh = meshCache.get(link.name);
-                if (mesh != null) {
-                    for (STLLoader.Triangle tri : mesh.triangles) {
-                        for (Vector3f v : tri.vertices) {
-                            minZ = Math.min(minZ, v.z);
-                        }
-                    }
-                }
-            }
-        }
-
-        // 발 링크 못 찾으면 전체 메쉬에서 최소 Z
-        if (!foundFootLink) {
-            for (STLLoader.STLMesh mesh : meshCache.values()) {
-                for (STLLoader.Triangle tri : mesh.triangles) {
-                    for (Vector3f v : tri.vertices) {
-                        minZ = Math.min(minZ, v.z);
-                    }
-                }
-            }
-        }
-
-        // 렌더 스케일 적용해서 블록 단위 오프셋으로 변환
-        groundOffset = -minZ * GLOBAL_SCALE;
-
-        logger.info("✓ Ground offset: {} blocks (raw Z: {}m, feet: {})",
-                groundOffset, minZ, foundFootLink);
-    }
+    // ========================================================================
+    // 조인트 이름 매핑
+    // ========================================================================
 
     /**
      * VMD 스타일 이름을 URDF 조인트 이름과 매핑
@@ -247,20 +259,94 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
     }
 
     public void setJointTarget(String name, float value) {
+        setJointTarget(name, value, JointControlSource.OTHER);
+    }
+
+    public void setJointTarget(String name, float value, JointControlSource source) {
         if (controller == null) return;
 
         String resolvedName = resolveJointName(name);
         if (resolvedName != null) {
+            if (!canApplyJointTarget(resolvedName, source)) {
+                if (DEBUG_MODE && renderCount < 5) {
+                    logger.debug("✗ Joint '{}' target blocked by manual lock (source={})", resolvedName, source);
+                }
+                return;
+            }
             controller.setTarget(resolvedName, value);
+            updateJointControlState(resolvedName, source);
         } else if (DEBUG_MODE && renderCount < 5) {
             logger.warn("✗ Joint NOT FOUND: '{}'", name);
         }
     }
 
     public void setJointTargets(Map<String, Float> values) {
+        setJointTargets(values, JointControlSource.OTHER);
+    }
+
+    public void setJointTargets(Map<String, Float> values, JointControlSource source) {
+        if (values == null) return;
         for (Map.Entry<String, Float> entry : values.entrySet()) {
-            setJointTarget(entry.getKey(), entry.getValue());
+            setJointTarget(entry.getKey(), entry.getValue(), source);
         }
+    }
+
+    public void setManualJointTarget(String name, float value) {
+        setJointPreview(name, value, JointControlSource.GUI);
+        setJointTarget(name, value, JointControlSource.GUI);
+    }
+
+    public void releaseManualJointLock(String name) {
+        String resolvedName = resolveJointName(name);
+        if (resolvedName == null) {
+            resolvedName = name;
+        }
+        JointControlState state = jointControlStates.get(resolvedName);
+        if (state != null) {
+            state.clearManualLock();
+        }
+    }
+
+    public void clearManualJointLocks() {
+        jointControlStates.values().forEach(JointControlState::clearManualLock);
+    }
+
+    public boolean isJointLockedByManual(String name) {
+        String resolvedName = resolveJointName(name);
+        if (resolvedName == null) {
+            resolvedName = name;
+        }
+        JointControlState state = jointControlStates.get(resolvedName);
+        return state != null && state.isManualLocked();
+    }
+
+    public boolean hasManualJointLocks() {
+        for (JointControlState state : jointControlStates.values()) {
+            if (state.isManualLocked()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean canApplyJointTarget(String resolvedName, JointControlSource source) {
+        if (source == JointControlSource.GUI) {
+            return true;
+        }
+        JointControlState state = jointControlStates.get(resolvedName);
+        if (state == null) {
+            return true;
+        }
+        return !state.isManualLocked();
+    }
+
+    private void updateJointControlState(String resolvedName, JointControlSource source) {
+        JointControlState state = jointControlStates.computeIfAbsent(resolvedName, key -> new JointControlState());
+        if (source == JointControlSource.GUI) {
+            state.markManualLocked();
+            return;
+        }
+        state.clearManualLockIfExpired();
     }
 
     public void setJointVelocity(String name, float velocity) {
@@ -272,10 +358,31 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
     }
 
     public void setJointPreview(String name, float value) {
+        setJointPreview(name, value, JointControlSource.OTHER);
+    }
+
+    public void setJointPreview(String name, float value, JointControlSource source) {
         if (controller == null) return;
         String resolvedName = resolveJointName(name);
-        if (resolvedName != null) {
-            controller.setPreviewPosition(resolvedName, value);
+        if (resolvedName == null) {
+            return;
+        }
+
+        if (source != JointControlSource.GUI) {
+            JointControlState state = jointControlStates.get(resolvedName);
+            if (state != null && state.isManualLocked()) {
+                if (DEBUG_MODE && renderCount < 5) {
+                    logger.debug("✗ Joint '{}' preview blocked by manual lock (source={})", resolvedName, source);
+                }
+                return;
+            }
+        }
+
+        controller.setPreviewPosition(resolvedName, value);
+
+        if (source == JointControlSource.GUI) {
+            JointControlState state = jointControlStates.computeIfAbsent(resolvedName, key -> new JointControlState());
+            state.markManualLocked();
         }
     }
 
@@ -318,21 +425,9 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
         }
     }
 
+// ========================================================================
+    // 물리 사용 여부 / 컨트롤러 접근
     // ========================================================================
-    // 루트 위치 / 물리 사용 여부
-    // ========================================================================
-
-    /**
-     * 물리 루트 위치(엔티티 로컬 좌표) → 없으면 기본 높이 반환
-     */
-    public float[] getRootWorldPosition() {
-        if (controller != null && controller.isUsingPhysics() && robotModel.rootLinkName != null) {
-            // 컨트롤러 쪽에서 루트 로컬 좌표를 관리한다고 가정
-            return controller.getRootLinkLocalPosition();
-        }
-        // 물리 안 쓰면 그냥 기본값
-        return new float[]{0.0f, BASE_HEIGHT + groundOffset, 0.0f};
-    }
 
     public boolean isUsingPhysics() {
         return controller != null && controller.isUsingPhysics();
@@ -381,23 +476,22 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
             poseStack.pushPose();
 
             if (controller != null && controller.isUsingPhysics()) {
-                // ★ 물리 모드: 루트 링크 로컬 위치(ODE 좌표)를 렌더 위치에 반영
+                // 물리 모드: 루트 링크 로컬 위치(ODE 좌표)를 그대로 사용
                 float[] rootLocal = controller.getRootLinkLocalPosition();
                 poseStack.translate(
                         rootLocal[0],
-                        rootLocal[1] + BASE_HEIGHT + groundOffset,
+                        rootLocal[1],
                         rootLocal[2]
                 );
             } else {
-                // 키네마틱 모드: 기존 고정 오프셋
-                float totalYOffset = BASE_HEIGHT + groundOffset;
-                poseStack.translate(0.0f, totalYOffset, 0.0f);
+                // 키네마틱 모드: 원점 기준
+                poseStack.translate(0.0f, 0.0f, 0.0f);
             }
 
             // ROS → Minecraft 좌표계 회전
             poseStack.mulPose(new Quaternionf(Q_ROS2MC));
 
-            // 메쉬 스케일 (위치에는 스케일 다시 안 곱함)
+            // 메쉬 스케일
             poseStack.scale(GLOBAL_SCALE, GLOBAL_SCALE, GLOBAL_SCALE);
 
             renderLinkRecursive(robotModel.rootLinkName, poseStack, vc, packedLight);
@@ -406,7 +500,6 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
 
         bufferSource.endBatch(RenderType.solid());
         RenderSystem.enableCull();
-
     }
 
     private void renderLinkRecursive(String linkName, PoseStack poseStack,
@@ -520,7 +613,7 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
             case CONTINUOUS: {
                 Vector3f axis;
                 if (joint.axis == null || joint.axis.xyz == null ||
-                    joint.axis.xyz.lengthSquared() < 1e-12f) {
+                        joint.axis.xyz.lengthSquared() < 1e-12f) {
                     axis = new Vector3f(1, 0, 0);
                 } else {
                     axis = new Vector3f(joint.axis.xyz);
@@ -535,7 +628,7 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
             case PRISMATIC: {
                 Vector3f axis;
                 if (joint.axis == null || joint.axis.xyz == null ||
-                    joint.axis.xyz.lengthSquared() < 1e-12f) {
+                        joint.axis.xyz.lengthSquared() < 1e-12f) {
                     axis = new Vector3f(1, 0, 0);
                 } else {
                     axis = new Vector3f(joint.axis.xyz);
