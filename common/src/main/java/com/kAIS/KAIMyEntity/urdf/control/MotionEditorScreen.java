@@ -3,6 +3,7 @@ package com.kAIS.KAIMyEntity.urdf.control;
 import com.kAIS.KAIMyEntity.rl.RLEnvironmentCore;
 import com.kAIS.KAIMyEntity.rl.RLVMDIntegration;
 import com.kAIS.KAIMyEntity.urdf.URDFModelOpenGLWithSTL;
+import com.kAIS.KAIMyEntity.urdf.URDFModelOpenGLWithSTL.JointControlSource;
 import com.kAIS.KAIMyEntity.urdf.vmd.VMDLoader;
 import com.kAIS.KAIMyEntity.rl.RLEnvironmentCore.AgentMode;
 import net.minecraft.client.Minecraft;
@@ -463,8 +464,12 @@ public final class MotionEditorScreen {
             };
             g.drawString(font, stateStr, 10, 5, stateColor, false);
 
+            if (renderer != null && renderer.hasManualJointLocks()) {
+                g.drawString(font, "Manual Override", 80, 5, COL_WARNING, false);
+            }
+
             int fps = Minecraft.getInstance().getFps();
-            g.drawString(font, "FPS: " + fps, 80, 5, COL_TEXT_DIM, false);
+            g.drawString(font, "FPS: " + fps, 180, 5, COL_TEXT_DIM, false);
         }
 
         private void renderHints(GuiGraphics g) {
@@ -653,8 +658,12 @@ public final class MotionEditorScreen {
             norm = Math.max(0, Math.min(1, norm));
             float value = ji.min + norm * (ji.max - ji.min);
             ji.value = value;
-            renderer.setJointPreview(jointName, value);
-            renderer.setJointTarget(jointName, value);
+            if (rlEnv != null && rlEnv.isInitialized() && rlEnv.isTraining()) {
+                rlEnv.stopTraining();
+                rlEnv.setAgentMode(AgentMode.MANUAL);
+                log(LogLevel.WARN, "RL training paused: manual override on " + jointName);
+            }
+            renderer.setManualJointTarget(jointName, value);
         }
 
         private void startPortEdit() {
@@ -690,6 +699,9 @@ public final class MotionEditorScreen {
 
             VMDPlayer.getInstance().stop();
             loadJoints();
+            if (renderer != null) {
+                renderer.clearManualJointLocks();
+            }
 
             // RL 환경 리셋
             if (rlEnv != null && rlEnv.isInitialized()) {
@@ -971,10 +983,10 @@ public final class MotionEditorScreen {
                 }
 
                 if (applyPreview) {
-                    renderer.setJointPreview(jointName, value);
+                    renderer.setJointPreview(jointName, value, JointControlSource.VMD);
                 }
                 if (applyTarget) {
-                    renderer.setJointTarget(jointName, value);
+                    renderer.setJointTarget(jointName, value, JointControlSource.VMD);
                 }
                 activeJointCount++;
             }
