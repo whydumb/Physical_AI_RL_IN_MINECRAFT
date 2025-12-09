@@ -1,12 +1,14 @@
 package com.kAIS.KAIMyEntity.rl;
 
 import com.kAIS.KAIMyEntity.urdf.URDFModelOpenGLWithSTL;
+import com.kAIS.KAIMyEntity.urdf.URDFModelOpenGLWithSTL.JointControlSource;
 import com.kAIS.KAIMyEntity.urdf.control.URDFMotion;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import java.util.*;
 import java.util.function.Consumer;
+import java.util.function.Supplier;
 
 /**
  * MuJoCo 스타일 RL 환경 (경량 버전)
@@ -19,7 +21,7 @@ import java.util.function.Consumer;
  *  - 내부 JointState 물리 시뮬레이터 제거
  *  - 항상 renderer.getJointPosition / getJointVelocity 를 사용
  *  - applyAction() 에서 바로 renderer.setJointTarget / setJointVelocity 호출
- *  - 루트 위치/속도도 renderer.getRootWorldPosition 기반으로 계산
+ *  - 루트 위치/속도는 renderer가 아니라, 외부에서 주입하는 공급자(Supplier)를 통해 계산
  */
 public class RLEnvironmentCore {
     private static final Logger logger = LogManager.getLogger();
@@ -39,8 +41,20 @@ public class RLEnvironmentCore {
     }
 
     // ========== 환경 상태 ==========
-    /** URDF + ODE 기반 렌더러 */
+    /** URDF + ODE 기반 렌더러 (조인트 상태 조회/명령에만 사용) */
     private URDFModelOpenGLWithSTL renderer;
+
+    /**
+     * (신규) 루트 높이 / 위치 공급자
+     *
+     * - heightSupplier  : 월드 기준 루트 Y (예: 컨트롤러 getApproxBaseHeightWorldY, 또는 mcEntity.getY())
+     * - rootXZSupplier  : 월드 기준 [x, z] (예: mcEntity.getX(), mcEntity.getZ())
+     *
+     * 이 두 공급자를 통해 getRootPosition()을 정의하므로,
+     * renderer.getRootWorldPosition() 에 전혀 의존하지 않는다.
+     */
+    private Supplier<Float> heightSupplier;
+    private Supplier<float[]> rootXZSupplier;
 
     /** 설정값 */
     private final Config config = new Config();
@@ -124,7 +138,7 @@ public class RLEnvironmentCore {
         // 2) 에이전트 초기화 (간단 선형 정책)
         agent = new SimpleAgent(jointMetas.size(), this::getObservationDim);
 
-        // 3) 루트 상태 초기화 (renderer 기반)
+        // 3) 루트 상태 초기화 (현재 등록된 공급자 기반)
         float[] rootPos = getRootPosition();
         System.arraycopy(rootPos, 0, prevRootPosition, 0, 3);
 
@@ -156,6 +170,42 @@ public class RLEnvironmentCore {
         return referenceMotion;
     }
 
+    // ========== 루트 상태 공급자 설정 ==========
+    /**
+     * RL에서 사용할 루트 높이/위치 공급자를 등록한다.
+     *
+     * @param heightSupplier   월드 기준 루트 Y를 반환하는 Supplier (null 허용)
+     * @param rootXZSupplier   월드 기준 [x, z] 를 반환하는 Supplier (null 허용, 길이 2 배열)
+     *
+     * 예)
+     *   CopyURDFSimpleController controller = renderer.getController();
+     *   env.setRootStateSuppliers(
+     *       () -> controller.getApproxBaseHeightWorldY(),
+     *       () -> new float[]{ (float)mcEntity.getX(), (float)mcEntity.getZ() }
+     *   );
+     *
+     *   // 임시로 엔티티의 Y만 사용하고 X/Z도 엔티티 기준으로 사용
+     *   env.setRootStateSuppliers(
+     *       () -> (float)mcEntity.getY(),
+     *       () -> new float[]{ (float)mcEntity.getX(), (float)mcEntity.getZ() }
+     *   );
+     */
+    public void setRootStateSuppliers(Supplier<Float> heightSupplier,
+                                      Supplier<float[]> rootXZSupplier) {
+        this.heightSupplier = heightSupplier;
+        this.rootXZSupplier = rootXZSupplier;
+    }
+
+    /** 높이만 바꾸고 싶을 때 */
+    public void setHeightSupplier(Supplier<Float> heightSupplier) {
+        this.heightSupplier = heightSupplier;
+    }
+
+    /** X/Z만 바꾸고 싶을 때 */
+    public void setRootXZSupplier(Supplier<float[]> rootXZSupplier) {
+        this.rootXZSupplier = rootXZSupplier;
+    }
+
     // ========== 메인 틱 ==========
     /**
      * 매 틱마다 호출되는 메인 RL 루프
@@ -174,7 +224,7 @@ public class RLEnvironmentCore {
         if (agentMode == AgentMode.MANUAL) return;
         if (renderer == null) return;
 
-        // 1. 현재 관측 (URDF 기반)
+        // 1. 현재 관측 (URDF 기반 + 외부 공급 루트 상태)
         float[] observation = getObservation();
 
         // 2. 에이전트로부터 행동 얻기
@@ -241,7 +291,7 @@ public class RLEnvironmentCore {
             }
 
             if (renderer != null) {
-                renderer.setJointTarget(jm.name, initPos);
+                renderer.setJointTarget(jm.name, initPos, JointControlSource.RL);
             }
         }
 
@@ -277,17 +327,17 @@ public class RLEnvironmentCore {
                     // 간단히 DELTA_POSITION처럼 근처 각도로 이동시키는 식으로 근사.
                     float delta = a * config.maxDeltaPosition;
                     float target = clamp(currentPos + delta, jm.minLimit, jm.maxLimit);
-                    renderer.setJointTarget(jm.name, target);
+                    renderer.setJointTarget(jm.name, target, JointControlSource.RL);
                 }
                 case POSITION -> {
                     // [-1,1] → [minLimit, maxLimit]
                     float target = jm.minLimit + (a + 1f) * 0.5f * (jm.maxLimit - jm.minLimit);
-                    renderer.setJointTarget(jm.name, target);
+                    renderer.setJointTarget(jm.name, target, JointControlSource.RL);
                 }
                 case DELTA_POSITION -> {
                     float delta = a * config.maxDeltaPosition;
                     float target = clamp(currentPos + delta, jm.minLimit, jm.maxLimit);
-                    renderer.setJointTarget(jm.name, target);
+                    renderer.setJointTarget(jm.name, target, JointControlSource.RL);
                 }
                 case VELOCITY -> {
                     float targetVel = a * config.maxVelocity;
@@ -324,7 +374,7 @@ public class RLEnvironmentCore {
             }
         }
 
-        // 3. 루트 높이 (renderer.getRootWorldPosition 기반, 정규화)
+        // 3. 루트 높이 (외부 공급자 기반, 정규화)
         float[] rootPos = getRootPosition();
         float heightRange = config.maxHeight - config.minHeight;
         float heightNorm = (heightRange > 0f)
@@ -355,18 +405,41 @@ public class RLEnvironmentCore {
     // ========== 루트 상태 ==========
     /**
      * 루트 위치
-     *  - renderer.getRootWorldPosition() 사용 (엔티티 로컬 기준)
+     *  - heightSupplier / rootXZSupplier 사용
      *  - [x, y, z] 반환
+     *
+     * heightSupplier가 null이면 y = config.targetHeight,
+     * rootXZSupplier가 null이면 x = z = 0 으로 동작한다.
      */
     private float[] getRootPosition() {
-        if (renderer == null) {
-            return new float[]{0f, config.targetHeight, 0f};
+        // Y(높이)
+        float y = config.targetHeight;
+        if (heightSupplier != null) {
+            try {
+                Float v = heightSupplier.get();
+                if (v != null) {
+                    y = v;
+                }
+            } catch (Exception e) {
+                logger.warn("heightSupplier threw exception", e);
+            }
         }
-        float[] p = renderer.getRootWorldPosition();
-        if (p == null || p.length < 3) {
-            return new float[]{0f, config.targetHeight, 0f};
+
+        // X/Z (수평 위치)
+        float x = 0f, z = 0f;
+        if (rootXZSupplier != null) {
+            try {
+                float[] xz = rootXZSupplier.get();
+                if (xz != null && xz.length >= 2) {
+                    x = xz[0];
+                    z = xz[1];
+                }
+            } catch (Exception e) {
+                logger.warn("rootXZSupplier threw exception", e);
+            }
         }
-        return new float[]{p[0], p[1], p[2]};
+
+        return new float[]{x, y, z};
     }
 
     /**
@@ -533,6 +606,13 @@ public class RLEnvironmentCore {
             return;
         }
         agentMode = mode;
+        boolean hadManualLocks = renderer != null && renderer.hasManualJointLocks();
+        if (renderer != null) {
+            renderer.clearManualJointLocks();
+        }
+        if (hadManualLocks) {
+            log("Cleared manual joint overrides before training");
+        }
         trainingActive = true;
         reset();
         log("Training started: mode=" + mode);
@@ -555,7 +635,7 @@ public class RLEnvironmentCore {
         if (idx == null) return;
         JointMeta jm = jointMetas.get(idx);
         float p = clamp(position, jm.minLimit, jm.maxLimit);
-        renderer.setJointTarget(name, p);
+        renderer.setJointTarget(name, p, JointControlSource.RL);
     }
 
     public void manualStep() {
