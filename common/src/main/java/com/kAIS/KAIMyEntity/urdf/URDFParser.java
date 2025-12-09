@@ -11,6 +11,8 @@ import org.w3c.dom.NodeList;
 import javax.xml.parsers.DocumentBuilder;
 import javax.xml.parsers.DocumentBuilderFactory;
 import java.io.File;
+import java.util.HashSet;  // ✅ 추가
+import java.util.Set;       // ✅ 추가
 
 public class URDFParser {
     private static final Logger logger = LogManager.getLogger();
@@ -28,7 +30,7 @@ public class URDFParser {
             logger.info("Base directory: " + baseDir.getAbsolutePath());
 
             DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
-            factory.setNamespaceAware(true); // 네임스페이스 활성화
+            factory.setNamespaceAware(true);
             DocumentBuilder builder = factory.newDocumentBuilder();
             Document doc = builder.parse(urdfFile);
             doc.getDocumentElement().normalize();
@@ -56,22 +58,37 @@ public class URDFParser {
             }
             logger.info("Found " + linkCount + " links");
 
-            // ----- joints -----
+            // ----- joints ----- ✅ 수정 시작
+            NodeList jointNodes = robotElement.getElementsByTagName("joint");
+            Set<String> processedJoints = new HashSet<>();
             int jointCount = 0;
-            for (int i = 0; i < all.getLength(); i++) {
-                Node n = all.item(i);
-                if (n.getNodeType() != Node.ELEMENT_NODE) continue;
-                String ln = n.getLocalName(), qn = n.getNodeName();
-                if (!"joint".equals(ln) && !"joint".equals(qn)) continue;
 
-                URDFJoint joint = parseJoint((Element) n);
+            for (int i = 0; i < jointNodes.getLength(); i++) {
+                Node n = jointNodes.item(i);
+                if (n.getNodeType() != Node.ELEMENT_NODE) continue;
+
+                Element jointElement = (Element) n;
+                String jointName = safeGetAttr(jointElement, "name");
+                if (isEmpty(jointName)) {
+                    jointName = findAttrByLocalName(jointElement, "name");
+                }
+
+                // 중복 체크
+                if (!isEmpty(jointName) && processedJoints.contains(jointName)) {
+                    logger.debug("Skipping duplicate joint: " + jointName);
+                    continue;
+                }
+
+                URDFJoint joint = parseJoint(jointElement);
                 if (joint != null) {
                     robot.addJoint(joint);
+                    processedJoints.add(joint.name);
                     jointCount++;
                     logger.debug("  + Joint: " + joint.name + " (" + joint.type + ")");
                 }
             }
             logger.info("Found " + jointCount + " joints");
+            // ✅ 수정 끝
 
             // 계층 구성
             robot.buildHierarchy();
