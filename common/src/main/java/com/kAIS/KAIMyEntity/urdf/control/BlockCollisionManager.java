@@ -151,8 +151,8 @@ public class BlockCollisionManager {
                 for (int z = -scanRadius; z <= scanRadius; z++) {
                     // 경계 근처만 체크 (최적화)
                     if (Math.abs(x) < scanRadius - 1 &&
-                        Math.abs(y) < scanRadius - 1 &&
-                        Math.abs(z) < scanRadius - 1) {
+                            Math.abs(y) < scanRadius - 1 &&
+                            Math.abs(z) < scanRadius - 1) {
                         continue;
                     }
 
