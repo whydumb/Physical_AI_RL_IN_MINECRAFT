@@ -17,10 +17,9 @@ import java.util.*;
  * URDF 컨트롤러 - 물리 + 블록 충돌 통합 (Geom 추가)
  *
  * 좌표계:
- * - ODE World = 엔티티 로컬 좌표계
- * - 루트 링크 = ODE (0, 0, 0) 근처 (고정 또는 자유)
- * - worldPosition = 마인크래프트 엔티티 절대 위치
- * - 블록 충돌 시: worldPosition + bodyLocalPos = 절대 위치
+ * - ODE World = 마인크래프트 월드 좌표계
+ * - 각 링크 Body = 월드 좌표에서의 위치/회전
+ * - worldPosition = "현재 엔티티 월드 위치" (엔티티와 루트 바디를 동기화할 때 사용)
  */
 public final class URDFSimpleController {
     private static final Logger logger = LogManager.getLogger();
@@ -63,6 +62,12 @@ public final class URDFSimpleController {
     // ========== 스케일 (URDF 단위 → 물리 단위) ==========
     private float physicsScale = 1.0f;
 
+    // 대표 루트 바디 (전신 위치/엔티티 이동 기준으로 사용할 링크 이름)
+    private String rootBodyLinkName;
+
+    // 한 번 월드 위치에 정렬(앵커)되었는지 여부
+    private boolean worldAnchored = false;
+
     // ODE4J 버전
     private enum ODE4JVersion { V03X, V04X, V05X, UNKNOWN }
     private ODE4JVersion odeVersion = ODE4JVersion.UNKNOWN;
@@ -99,6 +104,11 @@ public final class URDFSimpleController {
                                 boolean enablePhysics, Map<String, String> nameMapping) {
         this.urdfModel = model;
         this.jointNameMapping = nameMapping != null ? new HashMap<>(nameMapping) : new HashMap<>();
+
+        // 루트 바디 후보: URDF rootLinkName
+        this.rootBodyLinkName = (model != null && model.rootLinkName != null)
+                ? model.rootLinkName
+                : null;
 
         Map<String, URDFJoint> m = new HashMap<>();
         for (URDFJoint j : allJoints) {
@@ -152,16 +162,56 @@ public final class URDFSimpleController {
     }
 
     // ========================================================================
-    // 월드 컨텍스트 (렌더러에서 호출)
+    // 월드 컨텍스트 (렌더러/엔티티에서 호출)
     // ========================================================================
 
+    /**
+     * 현재 월드와 엔티티의 월드 위치 전달.
+     * 물리 모드에서는 최초 한 번, 루트 바디를 해당 위치로 정렬(앵커)한다.
+     */
     public void setWorldContext(Level level, Vec3 worldPos) {
         this.currentLevel = level;
         this.worldPosition = worldPos != null ? worldPos : Vec3.ZERO;
+
+        // 물리 모드 + 월드 초기화 완료 + 아직 앵커 안 됨 → 루트 바디를 엔티티 위치로 이동
+        if (usePhysics && physicsInitialized && !worldAnchored &&
+                physics != null && !bodies.isEmpty() && worldPos != null) {
+            anchorPhysicsToWorld(worldPos);
+            worldAnchored = true;
+        }
     }
 
     public Vec3 getWorldPosition() {
         return worldPosition;
+    }
+
+    /**
+     * 루트 바디 기준으로 모든 바디를 주어진 월드 위치로 평행 이동시킨다.
+     */
+    private void anchorPhysicsToWorld(Vec3 anchorWorldPos) {
+        try {
+            Object root = getRootBody();
+            if (root == null || physics == null) return;
+
+            double[] rootPos = physics.getBodyPosition(root);
+            if (rootPos == null || rootPos.length < 3) return;
+
+            double dx = anchorWorldPos.x - rootPos[0];
+            double dy = anchorWorldPos.y - rootPos[1];
+            double dz = anchorWorldPos.z - rootPos[2];
+
+            for (Object body : bodies.values()) {
+                if (body == null) continue;
+                double[] p = physics.getBodyPosition(body);
+                if (p == null || p.length < 3) continue;
+                physics.setBodyPosition(body, p[0] + dx, p[1] + dy, p[2] + dz);
+            }
+
+            logger.info("Anchored physics to world at ({}, {}, {})", anchorWorldPos.x, anchorWorldPos.y, anchorWorldPos.z);
+
+        } catch (Exception e) {
+            logger.warn("anchorPhysicsToWorld failed: {}", e.getMessage());
+        }
     }
 
     // ========================================================================
@@ -184,6 +234,7 @@ public final class URDFSimpleController {
     private void updatePhysicsWithCollision(float dt) {
         // 1. 블록 static geom 업데이트
         if (blockCollisionManager != null && currentLevel != null) {
+            // 여기서는 엔티티(혹은 루트 바디)의 현재 월드 위치 주변 블록을 스캔
             blockCollisionManager.updateCollisionArea(
                     currentLevel,
                     worldPosition.x,
@@ -310,8 +361,13 @@ public final class URDFSimpleController {
             }
         }
 
-        logger.info("Physics model: {} bodies, {} geoms, {} joints",
-                bodies.size(), geoms.size(), odeJoints.size());
+        // 루트 바디 이름 보정
+        if (rootBodyLinkName != null && !bodies.containsKey(rootBodyLinkName)) {
+            rootBodyLinkName = bodies.keySet().stream().findFirst().orElse(null);
+        }
+
+        logger.info("Physics model: {} bodies, {} geoms, {} joints (rootBody = {})",
+                bodies.size(), geoms.size(), odeJoints.size(), rootBodyLinkName);
 
         if (bodies.isEmpty()) {
             throw new IllegalStateException("No ODE bodies created");
@@ -371,7 +427,7 @@ public final class URDFSimpleController {
             // 질량 + geom 정보
             GeometryInfo geomInfo = setDefaultMass(body, link);
 
-            // 초기 위치 (엔티티 로컬)
+            // 초기 위치 (월드 좌표 기준, 생성 시점에는 (0,0,0) 근처에서 시작)
             if (link.visual != null && link.visual.origin != null) {
                 physics.setBodyPosition(body,
                         link.visual.origin.xyz.x * physicsScale,
@@ -400,10 +456,6 @@ public final class URDFSimpleController {
             return null;
         }
     }
-
-    // ========================================================================
-    // Geom 생성 헬퍼
-    // ========================================================================
 
     private static class GeometryInfo {
         String type;
@@ -859,24 +911,49 @@ public final class URDFSimpleController {
     }
 
     // ========================================================================
-    // 루트 링크 위치 (렌더러용)
+    // 루트 링크 / 루트 바디 위치 (렌더러/엔티티용)
     // ========================================================================
 
-    public float[] getRootLinkLocalPosition() {
-        if (!usePhysics) return new float[]{0, 0, 0};
-        if (bodies.isEmpty()) return new float[]{0, 0, 0};
+    private Object getRootBody() {
+        if (bodies.isEmpty()) return null;
 
-        Object firstBody = bodies.values().iterator().next();
-        if (firstBody != null && physics != null) {
-            double[] pos = physics.getBodyPosition(firstBody);
-            return new float[]{(float) pos[0], (float) pos[1], (float) pos[2]};
+        if (rootBodyLinkName != null) {
+            Object root = bodies.get(rootBodyLinkName);
+            if (root != null) return root;
         }
-
-        return new float[]{0, 0, 0};
+        return bodies.values().iterator().next();
     }
 
+    /**
+     * 렌더러에서 사용할 "엔티티 기준 루트 오프셋".
+     * 현재 설계에서는 엔티티 위치를 루트 바디 월드 위치에 맞추기 때문에,
+     * 이 값은 이상적으로 (0,0,0)에 가깝게 유지된다.
+     */
+    public float[] getRootLinkLocalPosition() {
+        if (!usePhysics || !physicsInitialized || physics == null || bodies.isEmpty()) {
+            return new float[]{0, 0, 0};
+        }
+
+        Object root = getRootBody();
+        if (root == null) return new float[]{0, 0, 0};
+
+        double[] pos = physics.getBodyPosition(root);
+        if (pos == null || pos.length < 3) {
+            return new float[]{0, 0, 0};
+        }
+
+        float lx = (float) (pos[0] - worldPosition.x);
+        float ly = (float) (pos[1] - worldPosition.y);
+        float lz = (float) (pos[2] - worldPosition.z);
+
+        return new float[]{lx, ly, lz};
+    }
+
+    /**
+     * 특정 링크의 월드 좌표를 반환 (ODE 월드 = 마인크래프트 월드).
+     */
     public float[] getLinkWorldPosition(String linkName) {
-        if (!usePhysics) {
+        if (!usePhysics || !physicsInitialized || physics == null) {
             return new float[]{
                     (float) worldPosition.x,
                     (float) worldPosition.y,
@@ -885,13 +962,11 @@ public final class URDFSimpleController {
         }
 
         Object body = bodies.get(linkName);
-        if (body != null && physics != null) {
-            double[] localPos = physics.getBodyPosition(body);
-            return new float[]{
-                    (float) (worldPosition.x + localPos[0]),
-                    (float) (worldPosition.y + localPos[1]),
-                    (float) (worldPosition.z + localPos[2])
-            };
+        if (body != null) {
+            double[] pos = physics.getBodyPosition(body);
+            if (pos != null && pos.length >= 3) {
+                return new float[]{(float) pos[0], (float) pos[1], (float) pos[2]};
+            }
         }
 
         return new float[]{
@@ -901,24 +976,19 @@ public final class URDFSimpleController {
         };
     }
 
-    // ========================================================================
-    // 베이스(발바닥) 높이 & 루트 바디 월드 위치 (RL/렌더러용)
-    // ========================================================================
-
     /**
      * 로봇에서 가장 낮은 바디의 "바닥면" 높이를 월드 좌표계 Y로 반환.
      *
-     * - 발이 지면에 닿아 있으면 ≈ 0 근처
-     * - 로봇이 떠 있으면 > 0
-     * - 지면 아래로 파고들면 < 0
+     * - 발이 지면에 닿아 있으면 ≈ 바닥 Y 근처
+     * - 로봇이 떠 있으면 > 바닥
+     * - 지면 아래로 파고들면 < 바닥
      */
     public float getApproxBaseHeightWorldY() {
         if (!usePhysics || !physicsInitialized || bodies.isEmpty() || physics == null) {
-            // 물리 안 쓰는 경우에는 엔티티 기준 위치를 그대로 사용
             return (float) worldPosition.y;
         }
 
-        double minBottomLocalY = Double.POSITIVE_INFINITY;
+        double minBottomWorldY = Double.POSITIVE_INFINITY;
 
         for (Map.Entry<String, Object> entry : bodies.entrySet()) {
             Object body = entry.getValue();
@@ -927,50 +997,46 @@ public final class URDFSimpleController {
             double[] pos = physics.getBodyPosition(body);
             if (pos == null || pos.length < 2) continue;
 
-            // linkRadii는 URDF 단위로 저장되어 있으므로 physicsScale까지 곱해 물리 단위로 맞춘다
             float radius = getLinkRadius(entry.getKey());
-            double bottomY = pos[1] - radius; // 바디 중심 Y - 반경
+            double bottomY = pos[1] - radius;
 
-            if (bottomY < minBottomLocalY) {
-                minBottomLocalY = bottomY;
+            if (bottomY < minBottomWorldY) {
+                minBottomWorldY = bottomY;
             }
         }
 
-        if (!Double.isFinite(minBottomLocalY)) {
-            // 실패 시: 첫 번째 바디 중심으로 fallback
+        if (!Double.isFinite(minBottomWorldY)) {
             Object firstBody = bodies.values().iterator().next();
             double[] pos = physics.getBodyPosition(firstBody);
             if (pos == null || pos.length < 2) {
                 return (float) worldPosition.y;
             }
-            minBottomLocalY = pos[1];
+            minBottomWorldY = pos[1];
         }
 
-        // ODE 로컬(Y) + 엔티티 월드 Y → 절대 월드 Y
-        double worldY = worldPosition.y + minBottomLocalY;
-        return (float) worldY;
+        return (float) minBottomWorldY;
     }
 
     /**
      * "루트"로 사용할 대표 바디의 월드 위치를 반환.
-     * 현재 구조상 별도의 루트 바디가 없어서, 첫 번째 동적 바디를 대표로 사용.
+     * 엔티티 위치를 이 값에 맞춰주면 전신이 물리에 따라 움직인다.
      */
     public double[] getRootBodyWorldPosition() {
         if (!usePhysics || !physicsInitialized || bodies.isEmpty() || physics == null) {
             return new double[]{worldPosition.x, worldPosition.y, worldPosition.z};
         }
 
-        Object firstBody = bodies.values().iterator().next();
-        double[] localPos = physics.getBodyPosition(firstBody);
-        if (localPos == null || localPos.length < 3) {
+        Object root = getRootBody();
+        if (root == null) {
             return new double[]{worldPosition.x, worldPosition.y, worldPosition.z};
         }
 
-        return new double[]{
-                worldPosition.x + localPos[0],
-                worldPosition.y + localPos[1],
-                worldPosition.z + localPos[2]
-        };
+        double[] pos = physics.getBodyPosition(root);
+        if (pos == null || pos.length < 3) {
+            return new double[]{worldPosition.x, worldPosition.y, worldPosition.z};
+        }
+
+        return new double[]{pos[0], pos[1], pos[2]};
     }
 
     // ========================================================================
@@ -1073,7 +1139,7 @@ public final class URDFSimpleController {
     public void setGains(float kp, float kd) {
         this.kp = kp;
         this.kd = kd;
-        this.physicsKp = kp * 5f;  // 예전보다 스케일 낮게
+        this.physicsKp = kp * 5f;
         this.physicsKd = kd * 3f;
     }
 
@@ -1133,6 +1199,7 @@ public final class URDFSimpleController {
         odeJoints.clear();
         linkRadii.clear();
         physicsInitialized = false;
+        worldAnchored = false;
 
         logger.info("URDFSimpleController cleaned up");
     }
@@ -1151,6 +1218,8 @@ public final class URDFSimpleController {
                 physics.setBodyAngularVel(body, 0, 0, 0);
             }
         }
+
+        worldAnchored = false;
 
         logger.info("Physics state reset");
     }
@@ -1171,12 +1240,11 @@ public final class URDFSimpleController {
         return r * physicsScale;
     }
 
+    /**
+     * "world" 같은 가상 루트만 고정, 실제 URDF rootLink는 동적 바디로 사용.
+     */
     private boolean isFixedLink(URDFLink link) {
-        if ("world".equals(link.name)) return true;
-        if (urdfModel != null && link.name.equals(urdfModel.rootLinkName)) {
-            return true;
-        }
-        return false;
+        return "world".equals(link.name);
     }
 
     private static float wrapToPi(float a) {
