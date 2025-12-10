@@ -13,8 +13,8 @@ import java.util.*;
  * 마인크래프트 블록과 ODE4J 물리 충돌 연동
  *
  * 좌표계:
- * - ODE World = 엔티티 로컬 좌표계
- * - 블록 지오메트리도 엔티티 기준 로컬 좌표로 변환하여 ODE에 넣는다.
+ * - ODE World = 마인크래프트 월드 좌표
+ * - 블록 지오메트리는 월드 좌표 그대로 ODE에 넣는다.
  *
  * 기능:
  * - 엔티티 주변 블록을 ODE4J static geometry로 변환
@@ -46,13 +46,6 @@ public class BlockCollisionManager {
     private BlockPos lastCenterPos = null;
     private Set<BlockPos> cachedSolidBlocks = new HashSet<>();
 
-    // ★ 추가: 마지막으로 updateCollisionArea가 호출됐을 때의 엔티티 월드 좌표
-    // ODE World = 엔티티 로컬 좌표계이기 때문에,
-    // 블록 지오메트리를 넣을 때 (블록 월드) - (엔티티 월드) 로 변환해서 사용한다.
-    private double lastEntityX = 0.0;
-    private double lastEntityY = 0.0;
-    private double lastEntityZ = 0.0;
-
     public BlockCollisionManager() {
         this.physics = PhysicsManager.GetInst();
 
@@ -80,12 +73,6 @@ public class BlockCollisionManager {
      */
     public void updateCollisionArea(Level level, double entityX, double entityY, double entityZ) {
         if (level == null || !odeGeomSupported) return;
-
-        // ★ 엔티티의 월드 좌표를 항상 최신으로 저장
-        // 이후 createBlockGeom 에서 "월드 → 엔티티 로컬" 변환에 사용
-        this.lastEntityX = entityX;
-        this.lastEntityY = entityY;
-        this.lastEntityZ = entityZ;
 
         tickCounter++;
         if (tickCounter < updateInterval) {
@@ -221,8 +208,8 @@ public class BlockCollisionManager {
      * PhysicsManager.space 안에 ODE4J Box Geometry 생성
      * ODE의 space.collide가 자동으로 이 geom을 인식함
      *
-     * 여기서 **ODE World = 엔티티 로컬 좌표계**를 만족시키기 위해
-     * (블록 월드 좌표) - (엔티티 월드 좌표) 로 로컬 변환해서 ODE에 넣는다.
+     * 여기서는 ODE World = 마인크래프트 월드 좌표 이므로,
+     * 블록의 월드 좌표를 그대로 사용한다.
      */
     private void createBlockGeom(BlockPos pos, BlockState state) {
         if (!odeGeomSupported || physics == null) return;
@@ -235,22 +222,15 @@ public class BlockCollisionManager {
                 return;
             }
 
-            // 1) 블록의 마인크래프트 "월드" 좌표 (블록 중심)
-            double wx = pos.getX() + 0.5;
-            double wy = pos.getY() + 0.5;
-            double wz = pos.getZ() + 0.5;
+            // 위치 설정 (블록 중심, 월드 좌표)
+            physics.setGeomPosition(
+                    geom,
+                    pos.getX() + 0.5,
+                    pos.getY() + 0.5,
+                    pos.getZ() + 0.5
+            );
 
-            // 2) ★ 엔티티 "로컬" 좌표계로 변환:
-            //    로컬 = 월드 - 엔티티월드
-            //    (ODE World = 엔티티 로컬)
-            double lx = wx - lastEntityX;
-            double ly = wy - lastEntityY;
-            double lz = wz - lastEntityZ;
-
-            // 3) ODE 지오메트리 위치를 "엔티티 로컬" 좌표로 설정
-            physics.setGeomPosition(geom, lx, ly, lz);
-
-            // 정적 geom으로 등록 (self-collision 제어용)
+            // 정적 geom으로 등록
             physics.registerStaticGeom(geom);
 
             blockGeoms.put(pos, geom);
@@ -301,8 +281,6 @@ public class BlockCollisionManager {
     }
 
     public void forceUpdate(Level level, double entityX, double entityY, double entityZ) {
-        // 강제 업데이트 시에도 엔티티 월드 좌표를 제대로 쓰기 위해
-        // updateCollisionArea 안에서 lastEntityX/Y/Z가 갱신된다.
         tickCounter = updateInterval;
         lastCenterPos = null; // 캐시 무효화
         updateCollisionArea(level, entityX, entityY, entityZ);
