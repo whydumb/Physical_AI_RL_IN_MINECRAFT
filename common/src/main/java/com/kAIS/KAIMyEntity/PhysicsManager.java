@@ -44,7 +44,7 @@ public class PhysicsManager {
     private Class<?> nearCallbackInterface;
 
     // 물리 설정
-    private double gravity = -9.81;
+    private double gravity = 9.81;
     private double stepSize = 1.0 / 60.0;
     private int maxContacts = 32;
 
