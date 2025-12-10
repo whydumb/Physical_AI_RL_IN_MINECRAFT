@@ -48,10 +48,10 @@ public final class URDFSimpleController {
 
     private final Map<String, Float> targetVelocities = new HashMap<>();
 
-    // 너무 과격하지 않게 초기값 낮춤
-    private float physicsKp = 50f;
-    private float physicsKd = 5f;
-    private float maxTorque = 20f;
+    // 물리용 PD 게인 / 토크 제한 (기본값을 조금 낮게)
+    private float physicsKp = 20f;
+    private float physicsKd = 2f;
+    private float maxTorque = 10f;
     private float maxForce = 100f;
 
     // ========== 블록 충돌 ==========
@@ -67,6 +67,13 @@ public final class URDFSimpleController {
 
     // 한 번 월드 위치에 정렬(앵커)되었는지 여부
     private boolean worldAnchored = false;
+
+    // 조인트 PD 모터 사용 여부
+    // *** 기본값을 true 로 변경 (물리 모드에서 바로 제어 가능하게)
+    private boolean motorsEnabled = true;
+
+    // 물리 서브스텝 수 (dt를 나눠서 더 안정적으로)
+    private int physicsSubSteps = 4;
 
     // ODE4J 버전
     private enum ODE4JVersion { V03X, V04X, V05X, UNKNOWN }
@@ -159,6 +166,15 @@ public final class URDFSimpleController {
             this.usePhysics = false;
             logger.info("URDFSimpleController: KINEMATIC mode");
         }
+
+        // *** 공통 후처리: 물리 모드일 때 기본 설정
+        if (usePhysics && physicsInitialized && physics != null) {
+            // 중력을 마인크래프트 기준 아래 방향(-Y)으로 강제
+            physics.setGravity(0, -9.81f, 0);
+
+            // 물리 모드 기본값: 조인트 모터 활성화
+            this.motorsEnabled = true;
+        }
     }
 
     // ========================================================================
@@ -207,7 +223,8 @@ public final class URDFSimpleController {
                 physics.setBodyPosition(body, p[0] + dx, p[1] + dy, p[2] + dz);
             }
 
-            logger.info("Anchored physics to world at ({}, {}, {})", anchorWorldPos.x, anchorWorldPos.y, anchorWorldPos.z);
+            logger.info("Anchored physics to world at ({}, {}, {})",
+                    anchorWorldPos.x, anchorWorldPos.y, anchorWorldPos.z);
 
         } catch (Exception e) {
             logger.warn("anchorPhysicsToWorld failed: {}", e.getMessage());
@@ -232,9 +249,8 @@ public final class URDFSimpleController {
      * PhysicsManager.step 내부에서 space.collide() + contact 처리가 수행됨.
      */
     private void updatePhysicsWithCollision(float dt) {
-        // 1. 블록 static geom 업데이트
+        // 1. 블록 static geom 업데이트 (틱당 한 번)
         if (blockCollisionManager != null && currentLevel != null) {
-            // 여기서는 엔티티(혹은 루트 바디)의 현재 월드 위치 주변 블록을 스캔
             blockCollisionManager.updateCollisionArea(
                     currentLevel,
                     worldPosition.x,
@@ -243,13 +259,20 @@ public final class URDFSimpleController {
             );
         }
 
-        // 2. 조인트 제어 (토크/힘 계산)
-        applyJointControls();
+        // 2. 서브스텝으로 물리 스텝 쪼개기 (안정성 향상)
+        int subSteps = Math.max(1, physicsSubSteps);
+        float subDt = dt / subSteps;
 
-        // 3. ODE 스텝 (중력 + 조인트 + 블록 충돌 전부)
-        physics.step(dt);
+        for (int i = 0; i < subSteps; i++) {
+            // 모터가 켜져 있을 때만 조인트 제어 토크 적용
+            if (motorsEnabled) {
+                applyJointControls();
+            }
+            // 중력 + 조인트 + 블록 충돌 전부 포함
+            physics.step(subDt);
+        }
 
-        // 4. URDF 조인트 상태 동기화
+        // 3. URDF 조인트 상태 동기화 (틱당 한 번)
         syncJointStates();
     }
 
@@ -427,7 +450,7 @@ public final class URDFSimpleController {
             // 질량 + geom 정보
             GeometryInfo geomInfo = setDefaultMass(body, link);
 
-            // 초기 위치 (월드 좌표 기준, 생성 시점에는 (0,0,0) 근처에서 시작)
+            // 초기 위치 (URDF 기반, 이후 anchorPhysicsToWorld 에서 월드 위치에 정렬)
             if (link.visual != null && link.visual.origin != null) {
                 physics.setBodyPosition(body,
                         link.visual.origin.xyz.x * physicsScale,
@@ -686,20 +709,67 @@ public final class URDFSimpleController {
         Method attach = dHingeJointClass.getMethod("attach", dBodyClass, dBodyClass);
         attach.invoke(odeJoint, childBody, parentBody);
 
+        // *** 축을 노멀라이즈해서 수치 폭주를 방지
         double[] axis = getJointAxis(joint);
+        double len = Math.sqrt(axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2]);
+        if (len < 1e-6) {
+            axis[0] = 0.0;
+            axis[1] = 0.0;
+            axis[2] = 1.0;
+        } else {
+            axis[0] /= len;
+            axis[1] /= len;
+            axis[2] /= len;
+        }
+
         Method setAxis = dHingeJointClass.getMethod(
                 "setAxis", double.class, double.class, double.class);
         setAxis.invoke(odeJoint, axis[0], axis[1], axis[2]);
 
-        if (joint.origin != null) {
-            try {
-                Method setAnchor = dHingeJointClass.getMethod(
-                        "setAnchor", double.class, double.class, double.class);
-                setAnchor.invoke(odeJoint,
-                        joint.origin.xyz.x * physicsScale,
-                        joint.origin.xyz.y * physicsScale,
-                        joint.origin.xyz.z * physicsScale);
-            } catch (Exception e) { }
+        // *** 앵커를 "URDF origin 절대좌표"가 아니라
+        //     실제 바디 위치 + 로컬 joint.origin 오프셋으로 계산
+        try {
+            Method setAnchor = dHingeJointClass.getMethod(
+                    "setAnchor", double.class, double.class, double.class);
+
+            double anchorX = 0.0;
+            double anchorY = 0.0;
+            double anchorZ = 0.0;
+            boolean baseFromBody = false;
+
+            if (physics != null) {
+                // 우선 자식 바디 위치를 기준으로 사용
+                if (childBody != null) {
+                    double[] p = physics.getBodyPosition(childBody);
+                    if (p != null && p.length >= 3) {
+                        anchorX = p[0];
+                        anchorY = p[1];
+                        anchorZ = p[2];
+                        baseFromBody = true;
+                    }
+                }
+                // 자식이 없으면 부모 바디 위치를 사용
+                if (!baseFromBody && parentBody != null) {
+                    double[] p = physics.getBodyPosition(parentBody);
+                    if (p != null && p.length >= 3) {
+                        anchorX = p[0];
+                        anchorY = p[1];
+                        anchorZ = p[2];
+                        baseFromBody = true;
+                    }
+                }
+            }
+
+            // joint.origin 이 있으면 로컬 오프셋으로 더해줌
+            if (joint.origin != null && joint.origin.xyz != null) {
+                anchorX += joint.origin.xyz.x * physicsScale;
+                anchorY += joint.origin.xyz.y * physicsScale;
+                anchorZ += joint.origin.xyz.z * physicsScale;
+            }
+
+            setAnchor.invoke(odeJoint, anchorX, anchorY, anchorZ);
+        } catch (Exception e) {
+            // 앵커 설정 실패해도 힌지 자체는 동작하므로 무시
         }
 
         if (joint.type == URDFJoint.JointType.REVOLUTE &&
@@ -978,10 +1048,6 @@ public final class URDFSimpleController {
 
     /**
      * 로봇에서 가장 낮은 바디의 "바닥면" 높이를 월드 좌표계 Y로 반환.
-     *
-     * - 발이 지면에 닿아 있으면 ≈ 바닥 Y 근처
-     * - 로봇이 떠 있으면 > 바닥
-     * - 지면 아래로 파고들면 < 바닥
      */
     public float getApproxBaseHeightWorldY() {
         if (!usePhysics || !physicsInitialized || bodies.isEmpty() || physics == null) {
@@ -1160,6 +1226,26 @@ public final class URDFSimpleController {
 
     public void setPhysicsScale(float scale) {
         this.physicsScale = scale;
+    }
+
+    /**
+     * 조인트 PD 모터 on/off.
+     * RL / VMD가 관절을 제어하고 싶을 때 true 로 켜면 됨.
+     */
+    public void setMotorsEnabled(boolean enabled) {
+        this.motorsEnabled = enabled;
+    }
+
+    public boolean isMotorsEnabled() {
+        return motorsEnabled;
+    }
+
+    /**
+     * 물리 서브스텝 개수 설정 (기본 4, 1~10 제한).
+     * 값이 클수록 안정하지만 느려짐.
+     */
+    public void setPhysicsSubSteps(int subSteps) {
+        this.physicsSubSteps = Math.max(1, Math.min(subSteps, 10));
     }
 
     public void applyExternalForce(String linkName, float fx, float fy, float fz) {
