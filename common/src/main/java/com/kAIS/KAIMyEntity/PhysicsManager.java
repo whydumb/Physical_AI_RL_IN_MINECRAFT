@@ -11,7 +11,13 @@ import java.util.IdentityHashMap;
 import java.util.Set;
 
 /**
- * ODE4J 물리 엔진 래퍼 - 완전한 ODE 충돌 처리 포함
+ * ODE4J 물리 엔진 래퍼 - 로봇 안정성 개선 패치 적용
+ *
+ * 주요 변경사항:
+ * 1. 중력 방향 수정 (Y-down)
+ * 2. 단단한 접촉 파라미터 (ERP=0.8, CFM=1e-5)
+ * 3. QuickStep iterations 증가 (50)
+ * 4. collide 메서드 시그니처 캐싱
  */
 public class PhysicsManager {
     private static final Logger logger = LogManager.getLogger();
@@ -39,27 +45,38 @@ public class PhysicsManager {
     private Class<?> dJointGroupClass;
     private Class<?> dContactClass;
     private Class<?> dContactBufferClass;
+    private Class<?> dContactGeomBufferClass;  // ✅ 추가
     private Class<?> dJointClass;
     private Class<?> odeConstantsClass;
     private Class<?> nearCallbackInterface;
+
+    // ✅ 메서드 캐시 추가
+    private Method collideMethod;
+    private Method setQuickStepNumIterationsMethod;
 
     // 물리 설정
     private double gravity = 9.81;
     private double stepSize = 1.0 / 60.0;
     private int maxContacts = 32;
 
-    // OdeConstants 값들 (reflection으로 로드)
+    // OdeConstants 값들
     private int dContactBounce;
     private int dContactApprox1;
     private int dContactSoftERP;
     private int dContactSoftCFM;
 
-    // geom 타입 구분용 (self-collision 제어)
-    // IdentityHashMap 을 써서 동일 객체 기준으로 비교
-    private final Set<Object> staticGeoms  =
-            Collections.newSetFromMap(new IdentityHashMap<>());
-    private final Set<Object> dynamicGeoms =
-            Collections.newSetFromMap(new IdentityHashMap<>());
+    // ✅ 튜닝 파라미터 (단단한 바닥 프리셋)
+    private double worldERP = 0.8;
+    private double worldCFM = 1e-5;
+    private boolean useSoftContacts = true;
+    private double contactSoftERP = 0.8;
+    private double contactSoftCFM = 1e-5;
+    private double contactMu = 1.0;
+    private boolean debugContacts = false;
+
+    // geom 타입 구분용
+    private final Set<Object> staticGeoms = Collections.newSetFromMap(new IdentityHashMap<>());
+    private final Set<Object> dynamicGeoms = Collections.newSetFromMap(new IdentityHashMap<>());
 
     private PhysicsManager() {
         try {
@@ -80,26 +97,25 @@ public class PhysicsManager {
     private void initialize() throws Exception {
         logger.info("Initializing ODE4J Physics...");
 
-        // ODE4J 클래스 로드
         odeClassLoader = Thread.currentThread().getContextClassLoader();
 
         try {
             final String base = "com.kAIS.ode4j.ode.";
 
-            odeHelperClass      = odeClassLoader.loadClass(base + "OdeHelper");
-            dWorldClass         = odeClassLoader.loadClass(base + "DWorld");
-            dSpaceClass         = odeClassLoader.loadClass(base + "DSpace");
-            dBodyClass          = odeClassLoader.loadClass(base + "DBody");
-            dMassClass          = odeClassLoader.loadClass(base + "DMass");
-            dGeomClass          = odeClassLoader.loadClass(base + "DGeom");
-            dJointGroupClass    = odeClassLoader.loadClass(base + "DJointGroup");
-            dContactClass       = odeClassLoader.loadClass(base + "DContact");
+            odeHelperClass = odeClassLoader.loadClass(base + "OdeHelper");
+            dWorldClass = odeClassLoader.loadClass(base + "DWorld");
+            dSpaceClass = odeClassLoader.loadClass(base + "DSpace");
+            dBodyClass = odeClassLoader.loadClass(base + "DBody");
+            dMassClass = odeClassLoader.loadClass(base + "DMass");
+            dGeomClass = odeClassLoader.loadClass(base + "DGeom");
+            dJointGroupClass = odeClassLoader.loadClass(base + "DJointGroup");
+            dContactClass = odeClassLoader.loadClass(base + "DContact");
             dContactBufferClass = odeClassLoader.loadClass(base + "DContactBuffer");
-            dJointClass         = odeClassLoader.loadClass(base + "DJoint");
-            odeConstantsClass   = odeClassLoader.loadClass(base + "OdeConstants");
+            dContactGeomBufferClass = odeClassLoader.loadClass(base + "DContactGeomBuffer");  // ✅ 추가
+            dJointClass = odeClassLoader.loadClass(base + "DJoint");
+            odeConstantsClass = odeClassLoader.loadClass(base + "OdeConstants");
             nearCallbackInterface = odeClassLoader.loadClass(base + "DGeom$DNearCallback");
 
-            // Box와 Plane 클래스
             try {
                 dBoxClass = odeClassLoader.loadClass(base + "DBox");
             } catch (ClassNotFoundException e) {
@@ -111,11 +127,10 @@ public class PhysicsManager {
                 dPlaneClass = dGeomClass;
             }
 
-            // OdeConstants 값 로드
-            dContactBounce   = odeConstantsClass.getField("dContactBounce").getInt(null);
-            dContactApprox1  = odeConstantsClass.getField("dContactApprox1").getInt(null);
-            dContactSoftERP  = odeConstantsClass.getField("dContactSoftERP").getInt(null);
-            dContactSoftCFM  = odeConstantsClass.getField("dContactSoftCFM").getInt(null);
+            dContactBounce = odeConstantsClass.getField("dContactBounce").getInt(null);
+            dContactApprox1 = odeConstantsClass.getField("dContactApprox1").getInt(null);
+            dContactSoftERP = odeConstantsClass.getField("dContactSoftERP").getInt(null);
+            dContactSoftCFM = odeConstantsClass.getField("dContactSoftCFM").getInt(null);
 
         } catch (ClassNotFoundException e) {
             logger.error("ODE4J classes not found - physics disabled", e);
@@ -157,17 +172,30 @@ public class PhysicsManager {
             logger.warn("Could not create contact group: {}", e.getMessage());
         }
 
-        // NearCallback 생성 (Proxy 사용)
+        // NearCallback 생성
         createNearCallback();
 
-        // 중력 설정 (Y-down)
-        setGravity(0, gravity, 0);
+        // ✅ 중력 설정: Y-down으로 수정
+        setGravity(0, -gravity, 0);
 
         // World 파라미터 설정
         setupWorldParameters();
 
+        // ✅ collide 메서드 캐시
+        collideMethod = odeHelperClass.getMethod(
+                "collide",
+                dGeomClass, dGeomClass, int.class, dContactGeomBufferClass
+        );
+
+        // ✅ quickStep iteration 캐시
+        try {
+            setQuickStepNumIterationsMethod = dWorldClass.getMethod("setQuickStepNumIterations", int.class);
+        } catch (Exception ignored) {
+            setQuickStepNumIterationsMethod = null;
+        }
+
         initialized = true;
-        logger.info("ODE4J Physics initialized successfully (gravityY = {})", gravity);
+        logger.info("ODE4J Physics initialized successfully (gravityY = {})", this.gravity);
     }
 
     private void createNearCallback() {
@@ -193,79 +221,71 @@ public class PhysicsManager {
     }
 
     /**
-     * space.collide 에서 호출되는 실제 충돌 처리
+     * ✅ 개선된 충돌 처리: 단단한 접촉 파라미터 사용
      */
     private void handleNearCallback(Object g1, Object g2) {
         try {
-            // 0) 동적/정적 geom 타입 판별
-            boolean g1Static  = staticGeoms.contains(g1);
-            boolean g2Static  = staticGeoms.contains(g2);
             boolean g1Dynamic = dynamicGeoms.contains(g1);
             boolean g2Dynamic = dynamicGeoms.contains(g2);
 
-            // self-collision(둘 다 dynamic) 은 일단 무시해서 조인트랑 안 싸우게 함
+            // self-collision 방지
             if (g1Dynamic && g2Dynamic) {
                 return;
             }
 
-            // Body 가져오기
             Method getBody = dGeomClass.getMethod("getBody");
             Object b1 = getBody.invoke(g1);
             Object b2 = getBody.invoke(g2);
 
-            // 둘 다 static / body 없음이면 무시
             if (b1 == null && b2 == null) {
                 return;
             }
 
-            // DContactBuffer 생성
             Object contacts = dContactBufferClass
                     .getConstructor(int.class)
                     .newInstance(maxContacts);
 
-            // getGeomBuffer() 호출
             Method getGeomBuffer = dContactBufferClass.getMethod("getGeomBuffer");
             Object contactGeomBuffer = getGeomBuffer.invoke(contacts);
 
-            // OdeHelper.collide(g1, g2, maxContacts, contactGeomBuffer)
-            Method collide = odeHelperClass.getMethod(
-                    "collide",
-                    dGeomClass, dGeomClass, int.class, contactGeomBuffer.getClass()
-            );
-            int numc = (Integer) collide.invoke(null, g1, g2, maxContacts, contactGeomBuffer);
+            // ✅ 캐시된 collideMethod 사용
+            int numc = (Integer) collideMethod.invoke(null, g1, g2, maxContacts, contactGeomBuffer);
+
+            if (debugContacts && numc > 0) {
+                logger.info("contacts: {}", numc);
+            }
 
             Method getContact = dContactBufferClass.getMethod("get", int.class);
 
             for (int i = 0; i < numc; i++) {
                 Object contact = getContact.invoke(contacts, i);
 
-                // contact.surface 설정
                 Object surface = dContactClass.getField("surface").get(contact);
                 Class<?> surfaceClass = surface.getClass();
 
-                // 너무 딱딱하게 하지 말고, 약간 말랑하게 설정
-                surfaceClass.getField("mode").setInt(
-                        surface,
-                        // Bounce 는 일단 끄고 SoftERP/CFM + Approx1 만 사용
-                        dContactApprox1 | dContactSoftERP | dContactSoftCFM
-                );
+                // ✅ 단단한 접촉 모드
+                int mode = dContactApprox1;
+                if (useSoftContacts) {
+                    mode |= (dContactSoftERP | dContactSoftCFM);
+                }
 
-                surfaceClass.getField("mu").setDouble(surface, 0.8);   // 마찰
+                surfaceClass.getField("mode").setInt(surface, mode);
+                surfaceClass.getField("mu").setDouble(surface, contactMu);
                 surfaceClass.getField("bounce").setDouble(surface, 0.0);
                 surfaceClass.getField("bounce_vel").setDouble(surface, 0.0);
 
-                // 부드러운 침투 보정
-                surfaceClass.getField("soft_erp").setDouble(surface, 0.2);   // 작은 ERP
-                surfaceClass.getField("soft_cfm").setDouble(surface, 1e-3);  // 조금 말랑하게
+                if (useSoftContacts) {
+                    // ✅ 단단하게: ERP=0.8, CFM=1e-5
+                    surfaceClass.getField("soft_erp").setDouble(surface, contactSoftERP);
+                    surfaceClass.getField("soft_cfm").setDouble(surface, contactSoftCFM);
+                }
 
-                // Contact joint 생성
                 Method createContactJoint = odeHelperClass.getMethod(
                         "createContactJoint",
                         dWorldClass, dJointGroupClass, dContactClass
                 );
                 Object joint = createContactJoint.invoke(null, world, contactGroup, contact);
 
-                // Joint attach
                 Method attach = dJointClass.getMethod("attach", dBodyClass, dBodyClass);
                 attach.invoke(joint, b1, b2);
             }
@@ -275,34 +295,28 @@ public class PhysicsManager {
         }
     }
 
+    /**
+     * ✅ 단단한 물리 파라미터 설정
+     */
     private void setupWorldParameters() {
         try {
-            // ERP (Error Reduction Parameter)
+            // ✅ ERP/CFM: 단단하게
             Method setERP = dWorldClass.getMethod("setERP", double.class);
-            setERP.invoke(world, 0.2);  // 전체적으로 조금 부드럽게
+            setERP.invoke(world, worldERP);
 
-            // CFM (Constraint Force Mixing)
             Method setCFM = dWorldClass.getMethod("setCFM", double.class);
-            setCFM.invoke(world, 1e-3);
+            setCFM.invoke(world, worldCFM);
 
-            // Auto-disable (성능 최적화)
+            // ✅ QuickStep iterations: 로봇 안정성을 위해 50으로 증가
+            if (setQuickStepNumIterationsMethod != null) {
+                setQuickStepNumIterationsMethod.invoke(world, 50);
+            }
+
+            // ✅ Auto-disable는 로봇에게 문제를 일으킬 수 있어 끔
             try {
                 Method setAutoDisable = dWorldClass.getMethod("setAutoDisableFlag", boolean.class);
-                setAutoDisable.invoke(world, true);
-
-                Method setAutoDisableLinearThreshold =
-                        dWorldClass.getMethod("setAutoDisableLinearThreshold", double.class);
-                setAutoDisableLinearThreshold.invoke(world, 0.01);
-
-                Method setAutoDisableAngularThreshold =
-                        dWorldClass.getMethod("setAutoDisableAngularThreshold", double.class);
-                setAutoDisableAngularThreshold.invoke(world, 0.01);
-
-                Method setAutoDisableSteps = dWorldClass.getMethod("setAutoDisableSteps", int.class);
-                setAutoDisableSteps.invoke(world, 10);
-            } catch (Exception e) {
-                logger.debug("Auto-disable not supported: {}", e.getMessage());
-            }
+                setAutoDisable.invoke(world, false);
+            } catch (Exception ignored) {}
 
         } catch (Exception e) {
             logger.warn("Could not set world parameters: {}", e.getMessage());
@@ -310,7 +324,79 @@ public class PhysicsManager {
     }
 
     // ========================================================================
-    // Body 관련
+    // ✅ 새로운 유틸리티 메서드
+    // ========================================================================
+
+    public double[] getGeomPosition(Object geom) {
+        if (geom == null) return new double[]{0, 0, 0};
+        try {
+            Method getPosition = geom.getClass().getMethod("getPosition");
+            Object pos = getPosition.invoke(geom);
+
+            Method get0 = pos.getClass().getMethod("get0");
+            Method get1 = pos.getClass().getMethod("get1");
+            Method get2 = pos.getClass().getMethod("get2");
+
+            return new double[]{
+                    ((Number) get0.invoke(pos)).doubleValue(),
+                    ((Number) get1.invoke(pos)).doubleValue(),
+                    ((Number) get2.invoke(pos)).doubleValue()
+            };
+        } catch (Exception e) {
+            return new double[]{0, 0, 0};
+        }
+    }
+
+    public void setGeomOffsetPosition(Object geom, double x, double y, double z) {
+        if (geom == null) return;
+
+        String[] candidates = new String[]{"setOffsetPosition", "setOffsetPos"};
+
+        for (String name : candidates) {
+            try {
+                Method m = geom.getClass().getMethod(name, double.class, double.class, double.class);
+                m.invoke(geom, x, y, z);
+                return;
+            } catch (Exception ignored) {}
+        }
+
+        // fallback
+        setGeomPosition(geom, x, y, z);
+    }
+
+    /**
+     * 런타임 접촉 파라미터 조정
+     */
+    public void setContactTuning(boolean soft, double softErp, double softCfm, double mu) {
+        this.useSoftContacts = soft;
+        this.contactSoftERP = softErp;
+        this.contactSoftCFM = softCfm;
+        this.contactMu = mu;
+    }
+
+    /**
+     * 런타임 월드 파라미터 조정
+     */
+    public void setWorldTuning(double erp, double cfm, int quickStepIterations) {
+        this.worldERP = erp;
+        this.worldCFM = cfm;
+        try {
+            Method setERP = dWorldClass.getMethod("setERP", double.class);
+            setERP.invoke(world, erp);
+            Method setCFM = dWorldClass.getMethod("setCFM", double.class);
+            setCFM.invoke(world, cfm);
+            if (setQuickStepNumIterationsMethod != null) {
+                setQuickStepNumIterationsMethod.invoke(world, quickStepIterations);
+            }
+        } catch (Exception ignored) {}
+    }
+
+    public void setDebugContacts(boolean enabled) {
+        this.debugContacts = enabled;
+    }
+
+    // ========================================================================
+    // Body 관련 (기존 메서드 유지)
     // ========================================================================
 
     public Object createBody() {
@@ -451,10 +537,9 @@ public class PhysicsManager {
     }
 
     // ========================================================================
-    // Geometry 관련 (블록 충돌 + 링크 콜리전용)
+    // Geometry 관련
     // ========================================================================
 
-    /** Box geometry 생성 */
     public Object createBoxGeom(double lx, double ly, double lz) {
         if (!initialized || space == null) return null;
 
@@ -468,7 +553,6 @@ public class PhysicsManager {
         }
     }
 
-    /** Sphere geometry 생성 */
     public Object createSphereGeom(double radius) {
         if (!initialized || space == null) return null;
 
@@ -482,7 +566,6 @@ public class PhysicsManager {
         }
     }
 
-    /** Cylinder / Capsule geometry 생성 (URDFSimpleController에서 사용) */
     public Object createCylinderGeom(double radius, double height) {
         if (!initialized || space == null) return null;
 
@@ -505,7 +588,6 @@ public class PhysicsManager {
         }
     }
 
-    /** Geometry 위치 설정 */
     public void setGeomPosition(Object geom, double x, double y, double z) {
         if (geom == null) return;
 
@@ -518,7 +600,6 @@ public class PhysicsManager {
         }
     }
 
-    /** Geometry에 Body 연결 */
     public void setGeomBody(Object geom, Object body) {
         if (geom == null) return;
 
@@ -530,26 +611,22 @@ public class PhysicsManager {
         }
     }
 
-    /** 동적 geom 등록 (로봇 링크 등) */
     public void registerDynamicGeom(Object geom) {
         if (geom != null) {
             dynamicGeoms.add(geom);
         }
     }
 
-    /** 정적 geom 등록 (블록, ground plane 등) */
     public void registerStaticGeom(Object geom) {
         if (geom != null) {
             staticGeoms.add(geom);
         }
     }
 
-    /** Geometry 제거 */
     public void destroyGeom(Object geom) {
         if (geom == null) return;
 
         try {
-            // set에서 제거
             staticGeoms.remove(geom);
             dynamicGeoms.remove(geom);
 
@@ -560,7 +637,6 @@ public class PhysicsManager {
         }
     }
 
-    /** 지면 평면 생성 (원하면 사용) */
     public void createGroundPlane(double height) {
         if (!initialized || space == null) return;
 
@@ -570,7 +646,6 @@ public class PhysicsManager {
                     dSpaceClass, double.class, double.class, double.class, double.class);
             groundPlane = createPlane.invoke(null, space, 0.0, 1.0, 0.0, height);
 
-            // 정적 geom으로 등록
             registerStaticGeom(groundPlane);
 
             logger.info("Created ground plane at Y={}", height);
@@ -583,12 +658,11 @@ public class PhysicsManager {
     // 시뮬레이션
     // ========================================================================
 
-    /** 물리 스텝 실행 - ODE 충돌 처리 포함 */
     public void step(float dt) {
         if (!initialized || world == null) return;
 
         try {
-            // 1. 모든 geom 쌍 충돌 검사
+            // 1. 충돌 검사
             if (space != null && nearCallback != null) {
                 Method spaceCollide = dSpaceClass.getMethod(
                         "collide", Object.class, nearCallbackInterface);
