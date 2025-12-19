@@ -11,16 +11,6 @@ import java.util.*;
 
 /**
  * 마인크래프트 블록과 ODE4J 물리 충돌 연동
- *
- * 좌표계:
- * - ODE World = 마인크래프트 월드 좌표
- * - 블록 지오메트리는 월드 좌표 그대로 ODE에 넣는다.
- *
- * 기능:
- * - 엔티티 주변 블록을 ODE4J static geometry로 변환
- * - 동적으로 충돌 영역 업데이트 (성능 최적화)
- * - 범위 밖 블록 자동 제거
- * - ODE4J의 space.collide가 자동으로 충돌 처리
  */
 public class BlockCollisionManager {
     private static final Logger logger = LogManager.getLogger();
@@ -35,14 +25,13 @@ public class BlockCollisionManager {
     private int updateInterval = 5;
     private int tickCounter = 0;
 
-    // 마인크래프트 1블록 = ODE4J 1미터
     private static final double BLOCK_SIZE = 1.0;
 
     // 통계
     private int totalBlocksCreated = 0;
     private int totalBlocksRemoved = 0;
 
-    // 캐시된 블록 정보 (매 틱 재스캔 방지)
+    // 캐시
     private BlockPos lastCenterPos = null;
     private Set<BlockPos> cachedSolidBlocks = new HashSet<>();
 
@@ -62,41 +51,33 @@ public class BlockCollisionManager {
         );
     }
 
-    /**
-     * 엔티티 주변 블록 충돌 업데이트 (메인 업데이트 메서드)
-     * static ODE geom만 관리, 실제 충돌은 physics.step 내부에서 처리됨
-     *
-     * @param level   현재 월드
-     * @param entityX 엔티티 월드 X
-     * @param entityY 엔티티 월드 Y
-     * @param entityZ 엔티티 월드 Z
-     */
     public void updateCollisionArea(Level level, double entityX, double entityY, double entityZ) {
         if (level == null || !odeGeomSupported) return;
 
-        tickCounter++;
-        if (tickCounter < updateInterval) {
-            return;
-        }
-        tickCounter = 0;
-
         BlockPos centerPos = BlockPos.containing(entityX, entityY, entityZ);
 
-        // 위치가 크게 변하지 않았으면 캐시 사용
-        if (lastCenterPos != null && lastCenterPos.closerThan(centerPos, 2)) {
-            // 기존 캐시 유지, 새 블록만 확인
-            updateIncrementally(level, centerPos);
+        // 최초 1회는 무조건 전체 스캔
+        if (lastCenterPos == null) {
+            fullScan(level, centerPos);
+            lastCenterPos = centerPos;
+            tickCounter = 0;
             return;
         }
 
-        // 전체 재스캔
-        fullScan(level, centerPos);
-        lastCenterPos = centerPos;
+        tickCounter++;
+        if (tickCounter < updateInterval) return;
+        tickCounter = 0;
+
+        if (lastCenterPos.closerThan(centerPos, 2)) {
+            updateIncrementally(level, centerPos);
+            // ✅ PATCH: 증분 업데이트 후에도 centerPos 갱신해야 캐시가 따라감
+            lastCenterPos = centerPos;
+        } else {
+            fullScan(level, centerPos);
+            lastCenterPos = centerPos;
+        }
     }
 
-    /**
-     * 전체 영역 스캔
-     */
     private void fullScan(Level level, BlockPos centerPos) {
         Set<BlockPos> currentBlocks = new HashSet<>();
 
@@ -106,7 +87,7 @@ public class BlockCollisionManager {
                     BlockPos pos = centerPos.offset(x, y, z);
                     BlockState state = level.getBlockState(pos);
 
-                    if (isSolidForCollision(state)) {
+                    if (isSolidForCollision(level, pos, state)) {
                         BlockPos immutablePos = pos.immutable();
                         currentBlocks.add(immutablePos);
 
@@ -118,25 +99,22 @@ public class BlockCollisionManager {
             }
         }
 
-        // 범위 밖 블록 제거
         removeOutOfRangeBlocks(currentBlocks);
-
-        // 캐시 업데이트
         cachedSolidBlocks = currentBlocks;
     }
 
     /**
-     * 증분 업데이트 (위치가 조금만 변했을 때)
+     * ✅ PATCH: 증분 업데이트 개선
+     * - 경계만 체크해서 add/remove
+     * - 그리고 현재 center 기준으로 scanRadius 밖으로 나간 cachedSolidBlocks도 제거
      */
     private void updateIncrementally(Level level, BlockPos centerPos) {
-        // 경계 영역만 체크
         Set<BlockPos> toAdd = new HashSet<>();
         Set<BlockPos> toRemove = new HashSet<>();
 
         for (int x = -scanRadius; x <= scanRadius; x++) {
             for (int y = -scanRadius; y <= scanRadius; y++) {
                 for (int z = -scanRadius; z <= scanRadius; z++) {
-                    // 경계 근처만 체크 (최적화)
                     if (Math.abs(x) < scanRadius - 1 &&
                             Math.abs(y) < scanRadius - 1 &&
                             Math.abs(z) < scanRadius - 1) {
@@ -146,7 +124,7 @@ public class BlockCollisionManager {
                     BlockPos pos = centerPos.offset(x, y, z).immutable();
                     BlockState state = level.getBlockState(pos);
 
-                    if (isSolidForCollision(state)) {
+                    if (isSolidForCollision(level, pos, state)) {
                         if (!cachedSolidBlocks.contains(pos)) {
                             toAdd.add(pos);
                         }
@@ -159,7 +137,6 @@ public class BlockCollisionManager {
             }
         }
 
-        // 적용
         for (BlockPos pos : toAdd) {
             cachedSolidBlocks.add(pos);
             if (!blockGeoms.containsKey(pos)) {
@@ -169,30 +146,43 @@ public class BlockCollisionManager {
 
         for (BlockPos pos : toRemove) {
             cachedSolidBlocks.remove(pos);
-            if (blockGeoms.containsKey(pos)) {
-                removeBlockGeom(blockGeoms.remove(pos));
+            Object geom = blockGeoms.remove(pos);
+            if (geom != null) removeBlockGeom(geom);
+        }
+
+        // ✅ PATCH: scanRadius 밖으로 벗어난 블록 정리 (center가 조금씩 이동할 때 누적 방지)
+        pruneOutsideCube(centerPos);
+    }
+
+    /**
+     * ✅ PATCH: isSolid() 대신 collision shape로 판정
+     * isSolid()가 false인 바닥에서도 충돌 shape가 있으면 geom을 생성하게 함.
+     */
+    private boolean isSolidForCollision(Level level, BlockPos pos, BlockState state) {
+        if (state.isAir()) return false;
+        return !state.getCollisionShape(level, pos).isEmpty();
+    }
+
+    private void pruneOutsideCube(BlockPos centerPos) {
+        if (cachedSolidBlocks.isEmpty()) return;
+
+        int r = scanRadius;
+
+        Iterator<BlockPos> it = cachedSolidBlocks.iterator();
+        while (it.hasNext()) {
+            BlockPos p = it.next();
+            int dx = Math.abs(p.getX() - centerPos.getX());
+            int dy = Math.abs(p.getY() - centerPos.getY());
+            int dz = Math.abs(p.getZ() - centerPos.getZ());
+
+            if (dx > r || dy > r || dz > r) {
+                it.remove();
+                Object geom = blockGeoms.remove(p);
+                if (geom != null) removeBlockGeom(geom);
             }
         }
     }
 
-    /**
-     * 블록이 충돌 처리 대상인지 확인
-     */
-    private boolean isSolidForCollision(BlockState state) {
-        if (state.isAir()) return false;
-
-        // 완전한 고체 블록
-        if (state.isSolid()) return true;
-
-        // 반블록, 계단 등도 포함할 수 있음 (옵션)
-        // if (state.getBlock() instanceof SlabBlock) return true;
-
-        return false;
-    }
-
-    /**
-     * 범위 밖 블록 제거
-     */
     private void removeOutOfRangeBlocks(Set<BlockPos> currentBlocks) {
         Iterator<Map.Entry<BlockPos, Object>> iterator = blockGeoms.entrySet().iterator();
         while (iterator.hasNext()) {
@@ -204,25 +194,16 @@ public class BlockCollisionManager {
         }
     }
 
-    /**
-     * PhysicsManager.space 안에 ODE4J Box Geometry 생성
-     * ODE의 space.collide가 자동으로 이 geom을 인식함
-     *
-     * 여기서는 ODE World = 마인크래프트 월드 좌표 이므로,
-     * 블록의 월드 좌표를 그대로 사용한다.
-     */
     private void createBlockGeom(BlockPos pos, BlockState state) {
         if (!odeGeomSupported || physics == null) return;
 
         try {
-            // PhysicsManager 래퍼를 통해 Box geom 생성
             Object geom = physics.createBoxGeom(BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE);
             if (geom == null) {
                 logger.warn("Failed to create geom for block at {}", pos);
                 return;
             }
 
-            // 위치 설정 (블록 중심, 월드 좌표)
             physics.setGeomPosition(
                     geom,
                     pos.getX() + 0.5,
@@ -230,7 +211,6 @@ public class BlockCollisionManager {
                     pos.getZ() + 0.5
             );
 
-            // 정적 geom으로 등록
             physics.registerStaticGeom(geom);
 
             blockGeoms.put(pos, geom);
@@ -241,9 +221,6 @@ public class BlockCollisionManager {
         }
     }
 
-    /**
-     * PhysicsManager 래퍼로 ODE4J Geometry 제거
-     */
     private void removeBlockGeom(Object geom) {
         if (geom == null || physics == null || !odeGeomSupported) return;
 
@@ -255,8 +232,6 @@ public class BlockCollisionManager {
         }
     }
 
-    // ========== 정리 ==========
-
     public void cleanup() {
         logger.info("Cleaning up BlockCollisionManager ({} active geoms)", blockGeoms.size());
 
@@ -265,12 +240,11 @@ public class BlockCollisionManager {
         }
         blockGeoms.clear();
         cachedSolidBlocks.clear();
+        lastCenterPos = null;
 
         logger.info("BlockCollisionManager cleaned up (created: {}, removed: {})",
                 totalBlocksCreated, totalBlocksRemoved);
     }
-
-    // ========== 설정 ==========
 
     public void setScanRadius(int radius) {
         this.scanRadius = Math.max(1, Math.min(radius, 16));
@@ -285,8 +259,6 @@ public class BlockCollisionManager {
         lastCenterPos = null; // 캐시 무효화
         updateCollisionArea(level, entityX, entityY, entityZ);
     }
-
-    // ========== 정보 조회 ==========
 
     public int getActiveBlockCount() {
         return blockGeoms.size();
@@ -308,9 +280,6 @@ public class BlockCollisionManager {
         return new HashSet<>(cachedSolidBlocks);
     }
 
-    /**
-     * 디버그 정보 반환
-     */
     public Map<String, Object> getDebugInfo() {
         Map<String, Object> info = new HashMap<>();
         info.put("activeBlocks", getActiveBlockCount());
