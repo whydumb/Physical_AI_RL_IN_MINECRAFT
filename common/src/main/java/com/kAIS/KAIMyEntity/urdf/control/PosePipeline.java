@@ -130,11 +130,11 @@ public final class PosePipeline {
 
         // === 고정 순서 끝 ===
 
-        // Webots 전송
+        // Webots 전송 (✅ 수정: sendFrame → setJoints)
         if (enableWebotsSend && !frameScratch.isEmpty()) {
             WebotsController wc = getWebots();
             if (wc != null) {
-                wc.sendFrame(frameScratch);
+                wc.setJoints(frameScratch);  // ✅ 수정됨
             }
         }
     }
