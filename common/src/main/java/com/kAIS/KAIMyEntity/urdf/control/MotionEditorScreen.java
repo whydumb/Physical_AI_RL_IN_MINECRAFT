@@ -45,7 +45,7 @@ public final class MotionEditorScreen {
                         && env.isTraining()
                         && env.getAgentMode() != AgentMode.MANUAL;
 
-        // 디버그 옵션: RL이 죽었든 말든, 최소한 “뭔가 움직이는 거”는 보이게 하고 싶다면 true
+        // 디버그 옵션: RL이 죽었든 말든, 최소한 "뭔가 움직이는 거"는 보이게 하고 싶다면 true
         final boolean FORCE_SHOW_VMD = false;   // 필요하면 true로 바꿔서 테스트
 
         if (!rlActive || FORCE_SHOW_VMD) {
@@ -810,19 +810,16 @@ public final class MotionEditorScreen {
         public void tick() {
             super.tick();
 
-            // RL 환경 틱
+            // ✅ RL 환경 상태 동기화만 수행 (실제 tick은 PosePipeline에서)
             if (rlEnv != null && rlEnv.isInitialized()) {
-                rlEnv.tick(0.05f); // 50ms per tick
-
-                // 상태 동기화
                 episodeReward = rlEnv.getEpisodeReward();
                 lastReward = rlEnv.getLastReward();
                 stepCount = rlEnv.getStepCount();
             }
 
+            // 시뮬레이션 시간 업데이트
             if (simState == SimState.RUNNING) {
                 simTime += 0.05f * simSpeed;
-                stepCount++;
             }
 
             // 관절 상태 동기화 (렌더러 → GUI)
