@@ -105,6 +105,13 @@ public class RLEnvironmentCore {
     public void initialize(URDFModelOpenGLWithSTL renderer) {
         this.renderer = renderer;
 
+        if (renderer != null) {
+            URDFSimpleController controller = renderer.getController();
+            if (controller != null) {
+                controller.setSpawnCollisionMargin(config.groundCollisionMargin);
+            }
+        }
+
         if (renderer == null) {
             log("WARN: Renderer is null");
             isInitialized = false;
@@ -453,6 +460,10 @@ public class RLEnvironmentCore {
             } catch (Exception e) {
                 logger.warn("rootXZSupplier threw exception while sampling spawn position", e);
             }
+        }
+
+        if (Float.isFinite(y) && config.groundCollisionMargin != 0f) {
+            y += config.groundCollisionMargin;
         }
 
         spawnRootPosition[0] = x;
@@ -835,6 +846,9 @@ public class RLEnvironmentCore {
         // 초기화
         public boolean randomizeInitial = true;
         public float initNoiseScale = 0.05f;
+
+        // 충돌 마진
+        public float groundCollisionMargin = 0.05f;
     }
 
     public static class Statistics {
