@@ -3,6 +3,7 @@ package com.kAIS.KAIMyEntity.rl;
 import com.kAIS.KAIMyEntity.urdf.URDFModelOpenGLWithSTL;
 import com.kAIS.KAIMyEntity.urdf.URDFModelOpenGLWithSTL.JointControlSource;
 import com.kAIS.KAIMyEntity.urdf.control.URDFMotion;
+import com.kAIS.KAIMyEntity.urdf.control.URDFSimpleController;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -82,6 +83,9 @@ public class RLEnvironmentCore {
 
     // 이전 루트 상태 (속도 추정용)
     private final float[] prevRootPosition = new float[3];
+    private final float[] spawnRootPosition = new float[3];
+    private boolean spawnPositionInitialized = false;
+    private boolean spawnPositionDirty = true;
 
     // 통계
     private final Statistics stats = new Statistics();
@@ -138,7 +142,9 @@ public class RLEnvironmentCore {
         // 2) 에이전트 초기화 (간단 선형 정책)
         agent = new SimpleAgent(jointMetas.size(), this::getObservationDim);
 
-        // 3) 루트 상태 초기화 (현재 등록된 공급자 기반)
+        // 3) 루트 상태 초기화 (스폰 캐시 기반)
+        spawnPositionDirty = true;
+        refreshSpawnRootPosition();
         float[] rootPos = getRootPosition();
         System.arraycopy(rootPos, 0, prevRootPosition, 0, 3);
 
@@ -194,16 +200,19 @@ public class RLEnvironmentCore {
                                       Supplier<float[]> rootXZSupplier) {
         this.heightSupplier = heightSupplier;
         this.rootXZSupplier = rootXZSupplier;
+        this.spawnPositionDirty = true;
     }
 
     /** 높이만 바꾸고 싶을 때 */
     public void setHeightSupplier(Supplier<Float> heightSupplier) {
         this.heightSupplier = heightSupplier;
+        this.spawnPositionDirty = true;
     }
 
     /** X/Z만 바꾸고 싶을 때 */
     public void setRootXZSupplier(Supplier<float[]> rootXZSupplier) {
         this.rootXZSupplier = rootXZSupplier;
+        this.spawnPositionDirty = true;
     }
 
     // ========== 메인 틱 ==========
@@ -295,6 +304,8 @@ public class RLEnvironmentCore {
             }
         }
 
+        spawnPositionDirty = true;
+        refreshSpawnRootPosition();
         float[] rootPos = getRootPosition();
         System.arraycopy(rootPos, 0, prevRootPosition, 0, 3);
 
@@ -404,42 +415,78 @@ public class RLEnvironmentCore {
 
     // ========== 루트 상태 ==========
     /**
-     * 루트 위치
-     *  - heightSupplier / rootXZSupplier 사용
-     *  - [x, y, z] 반환
-     *
-     * heightSupplier가 null이면 y = config.targetHeight,
-     * rootXZSupplier가 null이면 x = z = 0 으로 동작한다.
+     * 스폰 시점에 외부 공급자에서 루트 좌표를 샘플링해 캐싱하고,
+     * 이후에는 물리 엔진의 루트 바디 월드 좌표를 우선 사용한다.
+     * 물리 좌표를 얻지 못한 경우에 한해 캐시된 스폰 위치를 반환한다.
      */
-    private float[] getRootPosition() {
-        // Y(높이)
-        float y = config.targetHeight;
+    private void refreshSpawnRootPosition() {
+        if (!spawnPositionDirty && spawnPositionInitialized) {
+            return;
+        }
+
+        float x = spawnPositionInitialized ? spawnRootPosition[0] : 0f;
+        float y = spawnPositionInitialized ? spawnRootPosition[1] : config.targetHeight;
+        float z = spawnPositionInitialized ? spawnRootPosition[2] : 0f;
+
         if (heightSupplier != null) {
             try {
-                Float v = heightSupplier.get();
-                if (v != null) {
-                    y = v;
+                Float sampledY = heightSupplier.get();
+                if (sampledY != null && Float.isFinite(sampledY)) {
+                    y = sampledY;
                 }
             } catch (Exception e) {
-                logger.warn("heightSupplier threw exception", e);
+                logger.warn("heightSupplier threw exception while sampling spawn position", e);
             }
         }
 
-        // X/Z (수평 위치)
-        float x = 0f, z = 0f;
         if (rootXZSupplier != null) {
             try {
                 float[] xz = rootXZSupplier.get();
                 if (xz != null && xz.length >= 2) {
-                    x = xz[0];
-                    z = xz[1];
+                    if (Float.isFinite(xz[0])) {
+                        x = xz[0];
+                    }
+                    if (Float.isFinite(xz[1])) {
+                        z = xz[1];
+                    }
                 }
             } catch (Exception e) {
-                logger.warn("rootXZSupplier threw exception", e);
+                logger.warn("rootXZSupplier threw exception while sampling spawn position", e);
             }
         }
 
-        return new float[]{x, y, z};
+        spawnRootPosition[0] = x;
+        spawnRootPosition[1] = y;
+        spawnRootPosition[2] = z;
+        spawnPositionInitialized = true;
+        spawnPositionDirty = false;
+    }
+
+    private float[] getRootPosition() {
+        if (renderer != null) {
+            try {
+                URDFSimpleController controller = renderer.getController();
+                if (controller != null) {
+                    double[] rootWorld = controller.getRootBodyWorldPosition();
+                    if (rootWorld != null && rootWorld.length >= 3) {
+                        float x = (float) rootWorld[0];
+                        float y = (float) rootWorld[1];
+                        float z = (float) rootWorld[2];
+                        if (Float.isFinite(x) && Float.isFinite(y) && Float.isFinite(z)) {
+                            return new float[]{x, y, z};
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                logger.debug("Failed to read root position from physics", e);
+            }
+        }
+
+        if (!spawnPositionInitialized) {
+            refreshSpawnRootPosition();
+        }
+
+        return new float[]{spawnRootPosition[0], spawnRootPosition[1], spawnRootPosition[2]};
     }
 
     /**
