@@ -48,6 +48,8 @@ public final class URDFSimpleController {
 
     private final Map<String, Float> targetVelocities = new HashMap<>();
 
+    private double spawnCollisionMargin = 0.05;
+
     // 물리용 PD 게인 / 토크 제한
     private float physicsKp = 20f;
     private float physicsKd = 2f;
@@ -184,6 +186,14 @@ public final class URDFSimpleController {
         }
     }
 
+    public void setSpawnCollisionMargin(double margin) {
+        if (!Double.isFinite(margin) || margin < 0.0) {
+            logger.warn("Ignoring invalid spawn collision margin: {}", margin);
+            return;
+        }
+        this.spawnCollisionMargin = margin;
+    }
+
     // ========================================================================
     // 월드 컨텍스트 (렌더러/엔티티에서 호출)
     // ========================================================================
@@ -200,7 +210,13 @@ public final class URDFSimpleController {
         if (usePhysics && physicsInitialized && !worldAnchored &&
                 physics != null && !bodies.isEmpty() && worldPos != null) {
 
-            Vec3 safePos = new Vec3(worldPos.x, worldPos.y + 1.0, worldPos.z);
+            double clearance = computeRootClearance();
+            double targetY = worldPos.y + clearance + spawnCollisionMargin;
+            if (!Double.isFinite(targetY)) {
+                targetY = worldPos.y + 1.0;
+            }
+
+            Vec3 safePos = new Vec3(worldPos.x, targetY, worldPos.z);
             this.initialAnchorPosition = safePos;
 
             anchorPhysicsToWorld(safePos);
@@ -212,6 +228,47 @@ public final class URDFSimpleController {
                         blockCollisionManager.getActiveBlockCount());
             }
         }
+    }
+
+    private double computeRootClearance() {
+        double fallback = estimateFallbackClearance();
+        if (!usePhysics || !physicsInitialized || physics == null || bodies.isEmpty()) {
+            return fallback;
+        }
+
+        try {
+            Object root = getRootBody();
+            if (root == null) {
+                return fallback;
+            }
+            double[] rootPos = physics.getBodyPosition(root);
+            if (rootPos == null || rootPos.length < 3) {
+                return fallback;
+            }
+
+            float baseBottom = getApproxBaseHeightWorldY();
+            double clearance = rootPos[1] - baseBottom;
+            if (!Double.isFinite(clearance) || clearance <= 0.0) {
+                return fallback;
+            }
+            return clearance;
+        } catch (Exception e) {
+            logger.debug("computeRootClearance fallback: {}", e.getMessage());
+            return fallback;
+        }
+    }
+
+    private double estimateFallbackClearance() {
+        double maxRadius = 0.0;
+        for (float r : linkRadii.values()) {
+            if (Float.isFinite(r)) {
+                maxRadius = Math.max(maxRadius, r);
+            }
+        }
+        if (maxRadius > 0.0) {
+            return maxRadius;
+        }
+        return 1.0;
     }
 
     /**
