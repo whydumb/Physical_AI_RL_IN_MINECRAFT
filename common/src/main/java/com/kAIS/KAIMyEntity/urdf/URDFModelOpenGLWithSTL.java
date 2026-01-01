@@ -475,18 +475,18 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
         if (robotModel.rootLinkName != null) {
             poseStack.pushPose();
 
-            if (controller != null && controller.isUsingPhysics()) {
-                // 물리 모드: 루트 링크 로컬 위치(ODE 좌표)를 그대로 사용
-                float[] rootLocal = controller.getRootLinkLocalPosition();
-                poseStack.translate(
-                        rootLocal[0],
-                        rootLocal[1],
-                        rootLocal[2]
-                );
-            } else {
-                // 키네마틱 모드: 원점 기준
-                poseStack.translate(0.0f, 0.0f, 0.0f);
+            Vector3f rootOffset = entityTrans != null ? new Vector3f(entityTrans) : new Vector3f();
+            if (controller != null) {
+                if (controller.isUsingPhysics()) {
+                    Vec3 baseWorldPos = entityIn != null ? entityIn.position() : null;
+                    float[] rootLocal = controller.getRootLinkLocalPosition(baseWorldPos);
+                    if (rootLocal != null && rootLocal.length >= 3) {
+                        rootOffset.add(rootLocal[0], rootLocal[1], rootLocal[2]);
+                    }
+                }
             }
+
+            poseStack.translate(rootOffset.x(), rootOffset.y(), rootOffset.z());
 
             // ROS → Minecraft 좌표계 회전
             poseStack.mulPose(new Quaternionf(Q_ROS2MC));
