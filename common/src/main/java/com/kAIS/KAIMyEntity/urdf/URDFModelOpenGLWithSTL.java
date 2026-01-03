@@ -425,7 +425,7 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
         }
     }
 
-// ========================================================================
+    // ========================================================================
     // 물리 사용 여부 / 컨트롤러 접근
     // ========================================================================
 
@@ -488,7 +488,24 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
 
             poseStack.translate(rootOffset.x(), rootOffset.y(), rootOffset.z());
 
-            // ROS → Minecraft 좌표계 회전
+            // ✅ PATCH: 물리 루트 바디 회전(roll/pitch 포함)을 렌더에 반영
+            if (controller != null && controller.isUsingPhysics()) {
+                float[] qWxyz = controller.getRootBodyWorldQuaternionWXYZ();
+                if (qWxyz != null && qWxyz.length >= 4) {
+                    float w = qWxyz[0];
+                    float x = qWxyz[1];
+                    float y = qWxyz[2];
+                    float z = qWxyz[3];
+
+                    if (Float.isFinite(w) && Float.isFinite(x) && Float.isFinite(y) && Float.isFinite(z)) {
+                        // JOML Quaternionf는 (x,y,z,w) 순서
+                        Quaternionf qPhys = new Quaternionf(x, y, z, w).normalize();
+                        poseStack.mulPose(qPhys);
+                    }
+                }
+            }
+
+            // ROS → Minecraft 좌표계 회전 (기존 유지)
             poseStack.mulPose(new Quaternionf(Q_ROS2MC));
 
             // 메쉬 스케일
@@ -632,6 +649,7 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
                     axis = new Vector3f(1, 0, 0);
                 } else {
                     axis = new Vector3f(joint.axis.xyz);
+                    // ✅ 오타 수정: lengthSquard() → lengthSquared()
                     if (axis.lengthSquared() < 1e-12f) axis.set(1, 0, 0);
                     else axis.normalize();
                 }
