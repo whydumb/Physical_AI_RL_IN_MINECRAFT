@@ -1,5 +1,6 @@
 package com.kAIS.KAIMyEntity.urdf.control;
 
+import java.util.Locale;
 import com.kAIS.KAIMyEntity.PhysicsManager;
 import com.kAIS.KAIMyEntity.urdf.URDFJoint;
 import com.kAIS.KAIMyEntity.urdf.URDFLink;
@@ -97,6 +98,11 @@ public final class URDFSimpleController {
     private Method massSetSphereMethod;
     private Method bodySetMassMethod;
     private Method createMassMethod;
+
+    // ✅ ODE4J math 클래스 캐시 (shaded package 대응)
+    private ClassLoader odeCl;
+    private Class<?> dQuaternionClass;
+    private Class<?> dMatrix3Class;
 
     // ========================================================================
     // 생성자
@@ -370,6 +376,167 @@ public final class URDFSimpleController {
     }
 
     // ========================================================================
+    // 루트 바디 / 루트 바디 위치 (렌더러/엔티티용)
+    // ========================================================================
+
+    private Object getRootBody() {
+        if (bodies.isEmpty()) return null;
+
+        if (rootBodyLinkName != null) {
+            Object root = bodies.get(rootBodyLinkName);
+            if (root != null) return root;
+        }
+        return bodies.values().iterator().next();
+    }
+
+    /**
+     * ✅ NEW: 루트 바디의 월드 회전 쿼터니언 반환 (ODE 관례: w,x,y,z)
+     * 렌더러에서 roll/pitch까지 반영하기 위해 사용.
+     */
+    public float[] getRootBodyWorldQuaternionWXYZ() {
+        if (!usePhysics || !physicsInitialized || bodies.isEmpty() || physics == null) {
+            return new float[]{1f, 0f, 0f, 0f}; // identity
+        }
+
+        Object root = getRootBody();
+        if (root == null) {
+            return new float[]{1f, 0f, 0f, 0f};
+        }
+
+        float[] q = tryReadBodyQuaternionWXYZ(root);
+        if (q == null) {
+            return new float[]{1f, 0f, 0f, 0f};
+        }
+        return q;
+    }
+
+    /**
+     * ✅ 수정: baseWorldPos를 인자로 받음
+     * 로봇 루트 바디의 "현재 엔티티 기준 로컬 오프셋" 반환
+     */
+    public float[] getRootLinkLocalPosition(Vec3 baseWorldPos) {
+        if (!usePhysics || !physicsInitialized || physics == null || bodies.isEmpty()) {
+            return new float[]{0, 0, 0};
+        }
+
+        Object root = getRootBody();
+        if (root == null) return new float[]{0, 0, 0};
+
+        double[] pos = physics.getBodyPosition(root);
+        if (pos == null || pos.length < 3) {
+            return new float[]{0, 0, 0};
+        }
+
+        Vec3 base = (baseWorldPos != null) ? baseWorldPos : Vec3.ZERO;
+
+        return new float[]{
+                (float) (pos[0] - base.x),
+                (float) (pos[1] - base.y),
+                (float) (pos[2] - base.z)
+        };
+    }
+
+    /**
+     * ✅ 하위 호환용 (deprecated)
+     */
+    @Deprecated
+    public float[] getRootLinkLocalPosition() {
+        return getRootLinkLocalPosition(initialAnchorPosition != null ? initialAnchorPosition : Vec3.ZERO);
+    }
+
+    /**
+     * ✅ 수정: 링크의 월드 위치 반환 (baseWorldPos 불필요, 바로 월드 좌표 반환)
+     */
+    public float[] getLinkWorldPosition(String linkName) {
+        if (!usePhysics || !physicsInitialized || physics == null) {
+            Vec3 fallback = initialAnchorPosition != null ? initialAnchorPosition : Vec3.ZERO;
+            return new float[]{
+                    (float) fallback.x,
+                    (float) fallback.y,
+                    (float) fallback.z
+            };
+        }
+
+        Object body = bodies.get(linkName);
+        if (body != null) {
+            double[] pos = physics.getBodyPosition(body);
+            if (pos != null && pos.length >= 3) {
+                return new float[]{(float) pos[0], (float) pos[1], (float) pos[2]};
+            }
+        }
+
+        Vec3 fallback = initialAnchorPosition != null ? initialAnchorPosition : Vec3.ZERO;
+        return new float[]{
+                (float) fallback.x,
+                (float) fallback.y,
+                (float) fallback.z
+        };
+    }
+
+    /**
+     * ✅ 수정: 모든 바디 중 가장 낮은 Y 좌표 (월드 좌표계)
+     */
+    public float getApproxBaseHeightWorldY() {
+        if (!usePhysics || !physicsInitialized || bodies.isEmpty() || physics == null) {
+            Vec3 fallback = initialAnchorPosition != null ? initialAnchorPosition : Vec3.ZERO;
+            return (float) fallback.y;
+        }
+
+        double minBottomWorldY = Double.POSITIVE_INFINITY;
+
+        for (Map.Entry<String, Object> entry : bodies.entrySet()) {
+            Object body = entry.getValue();
+            if (body == null) continue;
+
+            double[] pos = physics.getBodyPosition(body);
+            if (pos == null || pos.length < 2) continue;
+
+            float radius = getLinkRadius(entry.getKey());
+            double bottomY = pos[1] - radius;
+
+            if (bottomY < minBottomWorldY) {
+                minBottomWorldY = bottomY;
+            }
+        }
+
+        if (!Double.isFinite(minBottomWorldY)) {
+            Object firstBody = bodies.values().iterator().next();
+            double[] pos = physics.getBodyPosition(firstBody);
+            if (pos == null || pos.length < 2) {
+                Vec3 fallback = initialAnchorPosition != null ? initialAnchorPosition : Vec3.ZERO;
+                return (float) fallback.y;
+            }
+            minBottomWorldY = pos[1];
+        }
+
+        return (float) minBottomWorldY;
+    }
+
+    /**
+     * ✅ 루트 바디의 월드 위치 반환
+     */
+    public double[] getRootBodyWorldPosition() {
+        if (!usePhysics || !physicsInitialized || bodies.isEmpty() || physics == null) {
+            Vec3 fallback = initialAnchorPosition != null ? initialAnchorPosition : Vec3.ZERO;
+            return new double[]{fallback.x, fallback.y, fallback.z};
+        }
+
+        Object root = getRootBody();
+        if (root == null) {
+            Vec3 fallback = initialAnchorPosition != null ? initialAnchorPosition : Vec3.ZERO;
+            return new double[]{fallback.x, fallback.y, fallback.z};
+        }
+
+        double[] pos = physics.getBodyPosition(root);
+        if (pos == null || pos.length < 3) {
+            Vec3 fallback = initialAnchorPosition != null ? initialAnchorPosition : Vec3.ZERO;
+            return new double[]{fallback.x, fallback.y, fallback.z};
+        }
+
+        return new double[]{pos[0], pos[1], pos[2]};
+    }
+
+    // ========================================================================
     // 메인 업데이트
     // ========================================================================
 
@@ -451,6 +618,17 @@ public final class URDFSimpleController {
         dJointGroupClass  = cl.loadClass(base + "DJointGroup");
 
         createMassMethod = odeHelperClass.getMethod("createMass");
+
+        odeCl = cl;
+
+        // ✅ shaded math 패키지 로드 시도
+        try { 
+            dQuaternionClass = cl.loadClass("com.kAIS.ode4j.math.DQuaternion"); 
+        } catch (Exception ignored) { }
+        
+        try { 
+            dMatrix3Class = cl.loadClass("com.kAIS.ode4j.math.DMatrix3"); 
+        } catch (Exception ignored) { }
     }
 
     private void detectODE4JVersion() {
@@ -1124,143 +1302,331 @@ public final class URDFSimpleController {
     }
 
     // ========================================================================
-    // 루트 링크 / 루트 바디 위치 (렌더러/엔티티용)
+    // ✅ Quaternion 읽기 유틸 (ODE4J/PhysicsManager 버전 차이를 리플렉션으로 흡수)
     // ========================================================================
 
-    private Object getRootBody() {
-        if (bodies.isEmpty()) return null;
+    private float[] tryReadBodyQuaternionWXYZ(Object body) {
+        if (body == null) return null;
 
-        if (rootBodyLinkName != null) {
-            Object root = bodies.get(rootBodyLinkName);
-            if (root != null) return root;
-        }
-        return bodies.values().iterator().next();
+        // 1) PhysicsManager에 getBodyQuaternion류 메서드가 있으면 우선 사용
+        float[] q = tryReadQuaternionFromPhysicsManager(body);
+        if (q != null) return q;
+
+        // 2) 바디 객체에서 getQuaternion() 시도 (ODE4J의 표준)
+        q = tryReadQuaternionFromBodyObject(body);
+        if (q != null) return q;
+
+        // 3) 회전행렬(getRotation)로부터 복구 (마지막 수단)
+        q = tryReadQuaternionFromRotation(body);
+        return q;
     }
 
-    /**
-     * ✅ 수정: baseWorldPos를 인자로 받음
-     * 로봇 루트 바디의 "현재 엔티티 기준 로컬 오프셋" 반환
-     */
-    public float[] getRootLinkLocalPosition(Vec3 baseWorldPos) {
-        if (!usePhysics || !physicsInitialized || physics == null || bodies.isEmpty()) {
-            return new float[]{0, 0, 0};
-        }
+    private float[] tryReadQuaternionFromPhysicsManager(Object body) {
+        if (physics == null) return null;
 
-        Object root = getRootBody();
-        if (root == null) return new float[]{0, 0, 0};
+        try {
+            for (Method m : physics.getClass().getMethods()) {
+                String n = m.getName();
+                if (m.getParameterCount() != 1) continue;
 
-        double[] pos = physics.getBodyPosition(root);
-        if (pos == null || pos.length < 3) {
-            return new float[]{0, 0, 0};
-        }
+                // 가능한 이름들 (프로젝트마다 다를 수 있어서 넓게)
+                if (!(n.equals("getBodyQuaternion") || n.equals("getBodyQuat") || n.equals("getQuaternion"))) {
+                    continue;
+                }
 
-        Vec3 base = (baseWorldPos != null) ? baseWorldPos : Vec3.ZERO;
+                Object ret = m.invoke(physics, body);
+                float[] q = parseQuatWXYZ(ret);
+                if (q != null) return q;
+            }
+        } catch (Exception ignored) { }
 
-        return new float[]{
-                (float) (pos[0] - base.x),
-                (float) (pos[1] - base.y),
-                (float) (pos[2] - base.z)
-        };
+        return null;
     }
 
-    /**
-     * ✅ 하위 호환용 (deprecated)
-     */
-    @Deprecated
-    public float[] getRootLinkLocalPosition() {
-        return getRootLinkLocalPosition(initialAnchorPosition != null ? initialAnchorPosition : Vec3.ZERO);
+    private float[] tryReadQuaternionFromBodyObject(Object body) {
+        try {
+            for (Method m : body.getClass().getMethods()) {
+                if (!m.getName().equals("getQuaternion")) continue;
+
+                // 1) getQuaternion() -> 반환형이 DQuaternionC 같은 경우
+                if (m.getParameterCount() == 0) {
+                    Object ret = m.invoke(body);
+                    float[] q = parseQuatWXYZ(ret);
+                    if (q != null) return q;
+                }
+
+                // 2) getQuaternion(out) -> out을 우리가 만들어서 주입
+                if (m.getParameterCount() == 1) {
+                    Class<?> pt = m.getParameterTypes()[0];
+
+                    Object out = createQuaternionOut(pt);
+                    if (out == null) continue;
+
+                    m.invoke(body, out);
+                    float[] q = parseQuatWXYZ(out);
+                    if (q != null) return q;
+                }
+            }
+        } catch (Exception ignored) { }
+        return null;
     }
 
-    /**
-     * ✅ 수정: 링크의 월드 위치 반환 (baseWorldPos 불필요, 바로 월드 좌표 반환)
-     */
-    public float[] getLinkWorldPosition(String linkName) {
-        if (!usePhysics || !physicsInitialized || physics == null) {
-            Vec3 fallback = initialAnchorPosition != null ? initialAnchorPosition : Vec3.ZERO;
-            return new float[]{
-                    (float) fallback.x,
-                    (float) fallback.y,
-                    (float) fallback.z
-            };
+    private Object createQuaternionOut(Class<?> expectedParamType) {
+        // (1) 파라미터 타입이 구체 클래스 + 기본생성자 있으면 그걸 생성
+        try {
+            if (!expectedParamType.isInterface()) {
+                return expectedParamType.getDeclaredConstructor().newInstance();
+            }
+        } catch (Exception ignored) { }
+
+        // (2) shaded DQuaternion을 알고 있으면 그걸 생성해서 "대입 가능"하면 사용
+        try {
+            if (dQuaternionClass != null && expectedParamType.isAssignableFrom(dQuaternionClass)) {
+                return dQuaternionClass.getDeclaredConstructor().newInstance();
+            }
+        } catch (Exception ignored) { }
+
+        return null;
+    }
+
+    private float[] tryReadQuaternionFromRotation(Object body) {
+        // 1) body.getRotation() (0-arg)
+        try {
+            for (Method m : body.getClass().getMethods()) {
+                if (!m.getName().equals("getRotation")) continue;
+
+                if (m.getParameterCount() == 0) {
+                    Object rot = m.invoke(body);
+                    float[] q = parseRotationToQuatWXYZ(rot);
+                    if (q != null) return q;
+                }
+
+                // 2) body.getRotation(out)
+                if (m.getParameterCount() == 1) {
+                    Class<?> pt = m.getParameterTypes()[0];
+                    Object out = createMatrix3Out(pt);
+                    if (out == null) continue;
+
+                    m.invoke(body, out);
+                    float[] q = parseRotationToQuatWXYZ(out);
+                    if (q != null) return q;
+                }
+            }
+        } catch (Exception ignored) { }
+
+        // 2) PhysicsManager 쪽 getBodyRotation 류 (param 1/2 모두 허용하도록 개선)
+        float[] q2 = tryReadRotationFromPhysicsManagerAnySignature(body);
+        if (q2 != null) return q2;
+
+        return null;
+    }
+
+    private Object createMatrix3Out(Class<?> expectedParamType) {
+        try {
+            if (!expectedParamType.isInterface()) {
+                return expectedParamType.getDeclaredConstructor().newInstance();
+            }
+        } catch (Exception ignored) { }
+
+        try {
+            if (dMatrix3Class != null && expectedParamType.isAssignableFrom(dMatrix3Class)) {
+                return dMatrix3Class.getDeclaredConstructor().newInstance();
+            }
+        } catch (Exception ignored) { }
+
+        return null;
+    }
+
+    private float[] tryReadRotationFromPhysicsManagerAnySignature(Object body) {
+        if (physics == null) return null;
+
+        try {
+            for (Method m : physics.getClass().getMethods()) {
+                String ln = m.getName().toLowerCase(Locale.ROOT);
+                if (!ln.contains("rotation")) continue;
+
+                // (A) getBodyRotation(body) -> 반환
+                if (m.getParameterCount() == 1) {
+                    Object ret = m.invoke(physics, body);
+                    float[] q = parseRotationToQuatWXYZ(ret);
+                    if (q != null) return q;
+                }
+
+                // (B) getBodyRotation(body, outArray) -> void
+                if (m.getParameterCount() == 2) {
+                    Class<?> p0 = m.getParameterTypes()[0];
+                    Class<?> p1 = m.getParameterTypes()[1];
+                    if (!p0.isAssignableFrom(body.getClass()) && p0 != Object.class) continue;
+
+                    if (p1 == double[].class) {
+                        double[] out = new double[12];
+                        m.invoke(physics, body, out);
+                        float[] q = parseRotationToQuatWXYZ(out);
+                        if (q != null) return q;
+                    } else if (p1 == float[].class) {
+                        float[] out = new float[12];
+                        m.invoke(physics, body, out);
+                        float[] q = parseRotationToQuatWXYZ(out);
+                        if (q != null) return q;
+                    }
+                }
+            }
+        } catch (Exception ignored) { }
+
+        return null;
+    }
+
+    private float[] parseQuatWXYZ(Object qObj) {
+        if (qObj == null) return null;
+
+        // 배열 형태
+        if (qObj instanceof double[]) {
+            double[] a = (double[]) qObj;
+            if (a.length >= 4) return normalizeQuatWXYZ((float)a[0], (float)a[1], (float)a[2], (float)a[3]);
+        }
+        if (qObj instanceof float[]) {
+            float[] a = (float[]) qObj;
+            if (a.length >= 4) return normalizeQuatWXYZ(a[0], a[1], a[2], a[3]);
         }
 
-        Object body = bodies.get(linkName);
-        if (body != null) {
-            double[] pos = physics.getBodyPosition(body);
-            if (pos != null && pos.length >= 3) {
-                return new float[]{(float) pos[0], (float) pos[1], (float) pos[2]};
+        // ODE4J DQuaternion 계열: get0/get1/get2/get3 (w,x,y,z)
+        try {
+            Method g0 = qObj.getClass().getMethod("get0");
+            Method g1 = qObj.getClass().getMethod("get1");
+            Method g2 = qObj.getClass().getMethod("get2");
+            Method g3 = qObj.getClass().getMethod("get3");
+            float w = ((Number) g0.invoke(qObj)).floatValue();
+            float x = ((Number) g1.invoke(qObj)).floatValue();
+            float y = ((Number) g2.invoke(qObj)).floatValue();
+            float z = ((Number) g3.invoke(qObj)).floatValue();
+            return normalizeQuatWXYZ(w, x, y, z);
+        } catch (Exception ignored) { }
+
+        // 혹시 getW/getX/getY/getZ 형태
+        try {
+            Method gw = qObj.getClass().getMethod("getW");
+            Method gx = qObj.getClass().getMethod("getX");
+            Method gy = qObj.getClass().getMethod("getY");
+            Method gz = qObj.getClass().getMethod("getZ");
+            float w = ((Number) gw.invoke(qObj)).floatValue();
+            float x = ((Number) gx.invoke(qObj)).floatValue();
+            float y = ((Number) gy.invoke(qObj)).floatValue();
+            float z = ((Number) gz.invoke(qObj)).floatValue();
+            return normalizeQuatWXYZ(w, x, y, z);
+        } catch (Exception ignored) { }
+
+        return null;
+    }
+
+    private float[] parseRotationToQuatWXYZ(Object rotObj) {
+        if (rotObj == null) return null;
+
+        // ODE4J rotation matrix는 종종 double[12] (3x4, row stride 4) 형태
+        if (rotObj instanceof double[]) {
+            double[] r = (double[]) rotObj;
+            if (r.length >= 12) {
+                float m00 = (float) r[0];
+                float m01 = (float) r[1];
+                float m02 = (float) r[2];
+                float m10 = (float) r[4];
+                float m11 = (float) r[5];
+                float m12 = (float) r[6];
+                float m20 = (float) r[8];
+                float m21 = (float) r[9];
+                float m22 = (float) r[10];
+                return quatFromMat3_WXYZ(m00,m01,m02,m10,m11,m12,m20,m21,m22);
+            }
+            if (r.length >= 9) {
+                float m00 = (float) r[0], m01 = (float) r[1], m02 = (float) r[2];
+                float m10 = (float) r[3], m11 = (float) r[4], m12 = (float) r[5];
+                float m20 = (float) r[6], m21 = (float) r[7], m22 = (float) r[8];
+                return quatFromMat3_WXYZ(m00,m01,m02,m10,m11,m12,m20,m21,m22);
             }
         }
 
-        Vec3 fallback = initialAnchorPosition != null ? initialAnchorPosition : Vec3.ZERO;
-        return new float[]{
-                (float) fallback.x,
-                (float) fallback.y,
-                (float) fallback.z
-        };
-    }
-
-    /**
-     * ✅ 수정: 모든 바디 중 가장 낮은 Y 좌표 (월드 좌표계)
-     */
-    public float getApproxBaseHeightWorldY() {
-        if (!usePhysics || !physicsInitialized || bodies.isEmpty() || physics == null) {
-            Vec3 fallback = initialAnchorPosition != null ? initialAnchorPosition : Vec3.ZERO;
-            return (float) fallback.y;
-        }
-
-        double minBottomWorldY = Double.POSITIVE_INFINITY;
-
-        for (Map.Entry<String, Object> entry : bodies.entrySet()) {
-            Object body = entry.getValue();
-            if (body == null) continue;
-
-            double[] pos = physics.getBodyPosition(body);
-            if (pos == null || pos.length < 2) continue;
-
-            float radius = getLinkRadius(entry.getKey());
-            double bottomY = pos[1] - radius;
-
-            if (bottomY < minBottomWorldY) {
-                minBottomWorldY = bottomY;
+        // float[] 형태도 지원
+        if (rotObj instanceof float[]) {
+            float[] r = (float[]) rotObj;
+            if (r.length >= 12) {
+                return quatFromMat3_WXYZ(r[0],r[1],r[2],r[4],r[5],r[6],r[8],r[9],r[10]);
+            }
+            if (r.length >= 9) {
+                return quatFromMat3_WXYZ(r[0],r[1],r[2],r[3],r[4],r[5],r[6],r[7],r[8]);
             }
         }
 
-        if (!Double.isFinite(minBottomWorldY)) {
-            Object firstBody = bodies.values().iterator().next();
-            double[] pos = physics.getBodyPosition(firstBody);
-            if (pos == null || pos.length < 2) {
-                Vec3 fallback = initialAnchorPosition != null ? initialAnchorPosition : Vec3.ZERO;
-                return (float) fallback.y;
-            }
-            minBottomWorldY = pos[1];
-        }
+        // DMatrix3 계열: get00/get01... 같은 accessor가 있을 수도 있음
+        try {
+            Method get00 = rotObj.getClass().getMethod("get00");
+            Method get01 = rotObj.getClass().getMethod("get01");
+            Method get02 = rotObj.getClass().getMethod("get02");
+            Method get10 = rotObj.getClass().getMethod("get10");
+            Method get11 = rotObj.getClass().getMethod("get11");
+            Method get12 = rotObj.getClass().getMethod("get12");
+            Method get20 = rotObj.getClass().getMethod("get20");
+            Method get21 = rotObj.getClass().getMethod("get21");
+            Method get22 = rotObj.getClass().getMethod("get22");
 
-        return (float) minBottomWorldY;
+            float m00 = ((Number)get00.invoke(rotObj)).floatValue();
+            float m01 = ((Number)get01.invoke(rotObj)).floatValue();
+            float m02 = ((Number)get02.invoke(rotObj)).floatValue();
+            float m10 = ((Number)get10.invoke(rotObj)).floatValue();
+            float m11 = ((Number)get11.invoke(rotObj)).floatValue();
+            float m12 = ((Number)get12.invoke(rotObj)).floatValue();
+            float m20 = ((Number)get20.invoke(rotObj)).floatValue();
+            float m21 = ((Number)get21.invoke(rotObj)).floatValue();
+            float m22 = ((Number)get22.invoke(rotObj)).floatValue();
+
+            return quatFromMat3_WXYZ(m00,m01,m02,m10,m11,m12,m20,m21,m22);
+        } catch (Exception ignored) { }
+
+        return null;
     }
 
-    /**
-     * ✅ 루트 바디의 월드 위치 반환
-     */
-    public double[] getRootBodyWorldPosition() {
-        if (!usePhysics || !physicsInitialized || bodies.isEmpty() || physics == null) {
-            Vec3 fallback = initialAnchorPosition != null ? initialAnchorPosition : Vec3.ZERO;
-            return new double[]{fallback.x, fallback.y, fallback.z};
+    private float[] quatFromMat3_WXYZ(float m00,float m01,float m02,
+                                      float m10,float m11,float m12,
+                                      float m20,float m21,float m22) {
+        float tr = m00 + m11 + m22;
+
+        float w, x, y, z;
+        if (tr > 0f) {
+            float s = (float) Math.sqrt(tr + 1f) * 2f;
+            w = 0.25f * s;
+            x = (m21 - m12) / s;
+            y = (m02 - m20) / s;
+            z = (m10 - m01) / s;
+        } else if (m00 > m11 && m00 > m22) {
+            float s = (float) Math.sqrt(1f + m00 - m11 - m22) * 2f;
+            w = (m21 - m12) / s;
+            x = 0.25f * s;
+            y = (m01 + m10) / s;
+            z = (m02 + m20) / s;
+        } else if (m11 > m22) {
+            float s = (float) Math.sqrt(1f + m11 - m00 - m22) * 2f;
+            w = (m02 - m20) / s;
+            x = (m01 + m10) / s;
+            y = 0.25f * s;
+            z = (m12 + m21) / s;
+        } else {
+            float s = (float) Math.sqrt(1f + m22 - m00 - m11) * 2f;
+            w = (m10 - m01) / s;
+            x = (m02 + m20) / s;
+            y = (m12 + m21) / s;
+            z = 0.25f * s;
         }
 
-        Object root = getRootBody();
-        if (root == null) {
-            Vec3 fallback = initialAnchorPosition != null ? initialAnchorPosition : Vec3.ZERO;
-            return new double[]{fallback.x, fallback.y, fallback.z};
-        }
+        return normalizeQuatWXYZ(w, x, y, z);
+    }
 
-        double[] pos = physics.getBodyPosition(root);
-        if (pos == null || pos.length < 3) {
-            Vec3 fallback = initialAnchorPosition != null ? initialAnchorPosition : Vec3.ZERO;
-            return new double[]{fallback.x, fallback.y, fallback.z};
+    private float[] normalizeQuatWXYZ(float w, float x, float y, float z) {
+        if (!Float.isFinite(w) || !Float.isFinite(x) || !Float.isFinite(y) || !Float.isFinite(z)) {
+            return null;
         }
-
-        return new double[]{pos[0], pos[1], pos[2]};
+        float n = (float) Math.sqrt(w*w + x*x + y*y + z*z);
+        if (!Float.isFinite(n) || n < 1e-8f) {
+            return new float[]{1f, 0f, 0f, 0f};
+        }
+        return new float[]{ w/n, x/n, y/n, z/n };
     }
 
     // ========================================================================
