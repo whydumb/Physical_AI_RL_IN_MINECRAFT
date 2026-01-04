@@ -9,6 +9,7 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.MultiBufferSource;
 import net.minecraft.client.renderer.RenderType;
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.Pose;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.phys.Vec3;
 import org.apache.logging.log4j.LogManager;
@@ -46,6 +47,29 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
      * specified duration in milliseconds, or to 0 to disable locking while still stamping ownership.
      */
     private static final long MANUAL_LOCK_DURATION_MS = -1L;
+
+    // ------------------------------------------------------------------------
+    // ✅ FIX: 스닉(Shift) 시 바닐라 렌더 오프셋으로 모델이 살짝 눌려 보이는 현상 제거
+    // ------------------------------------------------------------------------
+    /**
+     * When true, cancels ONLY the extra Y render offset applied while crouching/sneaking
+     * (i.e., the "pressed down" look when holding Shift).
+     *
+     * This is done by tracking the "baseline" entityTrans.y from the last non-crouching frame,
+     * then subtracting the delta while crouching.
+     */
+    private static final boolean CANCEL_CROUCH_RENDER_OFFSET_Y = true;
+
+    /** Baseline entityTrans.y captured when NOT crouching. */
+    private float lastNonCrouchEntityTransY = 0f;
+    private boolean hasLastNonCrouchEntityTransY = false;
+
+    /** Sanity threshold (in blocks) for how big the crouch-only delta can be. */
+    private static final float CROUCH_DELTA_SANITY_MAX = 0.75f;
+
+    private static boolean isCrouching(Entity e) {
+        return e != null && e.getPose() == Pose.CROUCHING;
+    }
 
     // ROS → Minecraft 좌표계 보정
     private static final Vector3f SRC_UP  = new Vector3f(0, 0, 1);
@@ -475,7 +499,34 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
         if (robotModel.rootLinkName != null) {
             poseStack.pushPose();
 
+            // ----------------------------------------------------------------
+            // rootOffset 계산 (entityTrans + (physics rootLocal))
+            // ----------------------------------------------------------------
             Vector3f rootOffset = entityTrans != null ? new Vector3f(entityTrans) : new Vector3f();
+
+            // ✅ FIX: Shift(스닉) 시 entityTrans.y에 포함되는 "추가 다운 오프셋"만 제거
+            if (CANCEL_CROUCH_RENDER_OFFSET_Y && entityIn != null && entityTrans != null) {
+                boolean crouching = isCrouching(entityIn);
+
+                if (!crouching) {
+                    // 스닉이 아닐 때의 baseline 저장
+                    lastNonCrouchEntityTransY = entityTrans.y;
+                    hasLastNonCrouchEntityTransY = true;
+                } else if (hasLastNonCrouchEntityTransY) {
+                    // crouch 상태에서 현재 Y와 baseline의 차이(=crouch only delta)를 상쇄
+                    float crouchDeltaY = entityTrans.y - lastNonCrouchEntityTransY;
+
+                    // sanity check: 이상하게 큰 값이면 잘못된 상황일 수 있으니 무시
+                    if (Math.abs(crouchDeltaY) <= CROUCH_DELTA_SANITY_MAX) {
+                        rootOffset.y -= crouchDeltaY;
+                    } else if (DEBUG_MODE && renderCount < 10) {
+                        logger.debug("Skip crouch offset cancel: deltaY={} (baselineY={}, currentY={})",
+                                crouchDeltaY, lastNonCrouchEntityTransY, entityTrans.y);
+                    }
+                }
+            }
+
+            // physics root local offset 더하기
             if (controller != null) {
                 if (controller.isUsingPhysics()) {
                     Vec3 baseWorldPos = entityIn != null ? entityIn.position() : null;
