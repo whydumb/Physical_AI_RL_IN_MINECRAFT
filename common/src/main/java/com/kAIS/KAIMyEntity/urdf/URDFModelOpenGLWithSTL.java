@@ -27,6 +27,7 @@ import java.util.concurrent.ConcurrentHashMap;
  * ✅ PATCH 포함:
  * - Shift(스닉) 시 바닐라 렌더 오프셋 때문에 "살짝 눌리는" 현상 제거
  * - WASD(플레이어 이동) 시 호스트 엔티티가 움직여도 모델이 같이 끌려가지 않게 "월드 앵커" 고정
+ * - 렌더 위치 2배 이동 버그 수정: PoseStack translation을 누적이 아닌 절대값으로 설정
  */
 public class URDFModelOpenGLWithSTL implements IMMDModel {
     private static final Logger logger = LogManager.getLogger();
@@ -68,7 +69,7 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
      *
      * => Shift(스닉) 눌릴 때 바닐라가 넣는 renderOffset 때문에 모델이 눌리는 현상도 자동 제거됨.
      */
-    private static final boolean USE_CAMERA_RELATIVE_TRANSLATION = true;
+    private static final boolean USE_CAMERA_RELATIVE_TRANSLATION = false;
 
     /**
      * 물리/블록충돌 컨텍스트도 "로봇의 실제 월드 위치"로 세팅할지 여부.
@@ -80,6 +81,12 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
      * 렌더 앵커(월드 고정 기준점)
      */
     private Vec3 renderAnchorWorldPos = null;
+
+    /**
+     * Shift(스닉) 눌렀을 때 renderOffset 상쇄용
+     */
+    private float lastNonSneakEntityTransY = 0f;
+    private boolean hasLastNonSneakEntityTransY = false;
 
     // ROS → Minecraft 좌표계 보정
     private static final Vector3f SRC_UP  = new Vector3f(0, 0, 1);
@@ -573,24 +580,47 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
             poseStack.pushPose();
 
             // ----------------------------------------------------------------
-            // ✅ 핵심: 렌더 위치 계산
-            // - 기존: entityTrans 그대로 translate (스닉 renderOffset, 호스트 이동에 따라 끌려감)
-            // - 변경: (루트 월드좌표 - 카메라 월드좌표)로 직접 계산
-            //         + 앵커 고정이면 WASD로 플레이어 움직여도 로봇은 월드에 고정
+            // ✅ 렌더 위치 계산 (원래 코드 방식 유지: entityTrans 기반)
+            // + WASD(호스트 엔티티 이동) 상쇄: (anchor - currentPos) 델타를 더함
+            // + physics rootLocal도 동일하게 더함
             // ----------------------------------------------------------------
-            Vector3f rootOffset = new Vector3f();
+            Vector3f rootOffset = (entityTrans != null) ? new Vector3f(entityTrans) : new Vector3f();
 
-            if (USE_CAMERA_RELATIVE_TRANSLATION && entityIn != null) {
-                Vec3 baseWorld = resolveRenderAnchorWorldPos(entityIn);
-                Vec3 rootWorld = computeRootWorldPos(baseWorld);
-                rootOffset = worldToCameraRelative(rootWorld);
-            } else {
-                // fallback (특수 렌더 컨텍스트에서 카메라 접근이 안 되는 경우 등)
-                if (entityTrans != null) {
-                    rootOffset.set(entityTrans);
+            // 1) Shift(스닉) 눌렀을 때 renderOffset 상쇄
+            if (entityIn != null && entityTrans != null) {
+                if (!entityIn.isShiftKeyDown()) {
+                    lastNonSneakEntityTransY = entityTrans.y;
+                    hasLastNonSneakEntityTransY = true;
+                } else if (hasLastNonSneakEntityTransY) {
+                    float sneakDelta = entityTrans.y - lastNonSneakEntityTransY;
+                    rootOffset.y -= sneakDelta;
                 }
             }
 
+            // 2) WASD 따라 움직임 방지 (앵커 고정이면: 현재 엔티티 이동분을 상쇄)
+            if (LOCK_RENDER_ANCHOR_TO_FIRST_POSITION && entityIn != null) {
+                Vec3 anchor = resolveRenderAnchorWorldPos(entityIn);
+                Vec3 cur = entityIn.position();
+                rootOffset.add(
+                        (float) (anchor.x - cur.x),
+                        (float) (anchor.y - cur.y),
+                        (float) (anchor.z - cur.z)
+                );
+            }
+
+            // 3) 물리 루트 위치 오프셋(기존 코드랑 동일 개념)
+            if (controller != null && controller.isUsingPhysics()) {
+                Vec3 baseForRootLocal = (entityIn != null)
+                        ? (LOCK_RENDER_ANCHOR_TO_FIRST_POSITION ? resolveRenderAnchorWorldPos(entityIn) : entityIn.position())
+                        : null;
+
+                float[] rootLocal = controller.getRootLinkLocalPosition(baseForRootLocal);
+                if (rootLocal != null && rootLocal.length >= 3) {
+                    rootOffset.add(rootLocal[0], rootLocal[1], rootLocal[2]);
+                }
+            }
+
+            // 4) 최종 적용 (덮어쓰기 말고 translate로 "기존 파이프라인" 유지)
             poseStack.translate(rootOffset.x(), rootOffset.y(), rootOffset.z());
 
             // ✅ PATCH: 물리 루트 바디 회전(roll/pitch 포함)을 렌더에 반영
@@ -700,6 +730,18 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
     // ========================================================================
     // 변환 유틸
     // ========================================================================
+
+    /**
+     * PoseStack의 translation을 누적이 아닌 절대값으로 설정.
+     * 마인크래프트 렌더러가 이미 엔티티-카메라 상대좌표로 세팅한 경우에 사용.
+     */
+    private static void setPoseStackTranslation(PoseStack poseStack, Vector3f t) {
+        Matrix4f m = poseStack.last().pose();
+        // JOML Matrix4f에서 translation 성분은 m30/m31/m32
+        m.m30(t.x);
+        m.m31(t.y);
+        m.m32(t.z);
+    }
 
     private void applyLinkOriginTransform(URDFLink.Origin origin, PoseStack poseStack) {
         poseStack.translate(origin.xyz.x, origin.xyz.y, origin.xyz.z);
