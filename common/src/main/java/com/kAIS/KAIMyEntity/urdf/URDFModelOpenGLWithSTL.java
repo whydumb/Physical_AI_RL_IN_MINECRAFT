@@ -9,7 +9,6 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.MultiBufferSource;
 import net.minecraft.client.renderer.RenderType;
 import net.minecraft.world.entity.Entity;
-import net.minecraft.world.entity.Pose;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.phys.Vec3;
 import org.apache.logging.log4j.LogManager;
@@ -24,6 +23,10 @@ import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * URDF 모델 렌더링 + ODE4J 물리 통합 + 블록 충돌 연동 버전
+ *
+ * ✅ PATCH 포함:
+ * - Shift(스닉) 시 바닐라 렌더 오프셋 때문에 "살짝 눌리는" 현상 제거
+ * - WASD(플레이어 이동) 시 호스트 엔티티가 움직여도 모델이 같이 끌려가지 않게 "월드 앵커" 고정
  */
 public class URDFModelOpenGLWithSTL implements IMMDModel {
     private static final Logger logger = LogManager.getLogger();
@@ -36,7 +39,6 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
     private final Map<String, STLLoader.STLMesh> meshCache = new HashMap<>();
 
     // 렌더 전용 스케일 (물리는 1블록 = 1m 기준으로 동작)
-    // 물리 스케일과 맞추려면 1.0f, 시각적으로만 크게 보이고 싶으면 5.0f 등으로 조정
     private static final float GLOBAL_SCALE = 1.0f;
 
     private static final boolean FLIP_NORMALS = true;
@@ -49,27 +51,35 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
     private static final long MANUAL_LOCK_DURATION_MS = -1L;
 
     // ------------------------------------------------------------------------
-    // ✅ FIX: 스닉(Shift) 시 바닐라 렌더 오프셋으로 모델이 살짝 눌려 보이는 현상 제거
+    // ✅ "Shift / WASD 따라 움직임" 방지 패치 설정
     // ------------------------------------------------------------------------
+
     /**
-     * When true, cancels ONLY the extra Y render offset applied while crouching/sneaking
-     * (i.e., the "pressed down" look when holding Shift).
+     * true면: 처음 본 월드 위치를 "렌더 앵커"로 고정함.
+     * => 플레이어(호스트 엔티티)가 WASD로 움직여도 URDF 모델은 월드에 고정.
      *
-     * This is done by tracking the "baseline" entityTrans.y from the last non-crouching frame,
-     * then subtracting the delta while crouching.
+     * (로봇 전용 엔티티로 렌더하는 경우에는 false로 두는 게 보통 맞음)
      */
-    private static final boolean CANCEL_CROUCH_RENDER_OFFSET_Y = true;
+    private static final boolean LOCK_RENDER_ANCHOR_TO_FIRST_POSITION = true;
 
-    /** Baseline entityTrans.y captured when NOT crouching. */
-    private float lastNonCrouchEntityTransY = 0f;
-    private boolean hasLastNonCrouchEntityTransY = false;
+    /**
+     * true면: entityTrans(렌더러가 주는 오프셋)를 무시하고,
+     * "월드좌표 - 카메라좌표"로 직접 렌더 위치를 계산함.
+     *
+     * => Shift(스닉) 눌릴 때 바닐라가 넣는 renderOffset 때문에 모델이 눌리는 현상도 자동 제거됨.
+     */
+    private static final boolean USE_CAMERA_RELATIVE_TRANSLATION = true;
 
-    /** Sanity threshold (in blocks) for how big the crouch-only delta can be. */
-    private static final float CROUCH_DELTA_SANITY_MAX = 0.75f;
+    /**
+     * 물리/블록충돌 컨텍스트도 "로봇의 실제 월드 위치"로 세팅할지 여부.
+     * (LOCK_RENDER_ANCHOR_TO_FIRST_POSITION가 true일 때는 true 권장)
+     */
+    private static final boolean USE_ROOT_WORLD_POS_FOR_WORLD_CONTEXT = true;
 
-    private static boolean isCrouching(Entity e) {
-        return e != null && e.getPose() == Pose.CROUCHING;
-    }
+    /**
+     * 렌더 앵커(월드 고정 기준점)
+     */
+    private Vec3 renderAnchorWorldPos = null;
 
     // ROS → Minecraft 좌표계 보정
     private static final Vector3f SRC_UP  = new Vector3f(0, 0, 1);
@@ -156,8 +166,6 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
         logger.info("=== URDF renderer Created (Scale: {}) ===", GLOBAL_SCALE);
 
         loadAllMeshes();
-        // STL 기반 groundOffset 보정은 제거 (물리/렌더 좌표 일치시키기 위함)
-        // calculateGroundOffset();
     }
 
     /**
@@ -190,6 +198,66 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
 
         logger.info("=== STL Loading Complete: {}/{} meshes ===",
                 loadedCount, robotModel.getLinkCount());
+    }
+
+    // ========================================================================
+    // ✅ Render Anchor / Root World Pos 유틸
+    // ========================================================================
+
+    /**
+     * 렌더 기준점(앵커) 월드 좌표를 결정.
+     * - LOCK_RENDER_ANCHOR_TO_FIRST_POSITION = true: 첫 위치로 고정
+     * - false: 엔티티 위치 따라감(기존 동작)
+     */
+    private Vec3 resolveRenderAnchorWorldPos(Entity entityIn) {
+        if (entityIn == null) {
+            return (renderAnchorWorldPos != null) ? renderAnchorWorldPos : Vec3.ZERO;
+        }
+
+        if (!LOCK_RENDER_ANCHOR_TO_FIRST_POSITION) {
+            return entityIn.position();
+        }
+
+        if (renderAnchorWorldPos == null) {
+            renderAnchorWorldPos = entityIn.position();
+            if (DEBUG_MODE) {
+                logger.info("Render anchor locked at {}", renderAnchorWorldPos);
+            }
+        }
+        return renderAnchorWorldPos;
+    }
+
+    /**
+     * 현재 로봇 "루트 링크"의 월드 좌표를 계산.
+     * baseWorldPos(앵커) + physics rootLocal(있으면)로 구성.
+     */
+    private Vec3 computeRootWorldPos(Vec3 baseWorldPos) {
+        if (baseWorldPos == null) {
+            return Vec3.ZERO;
+        }
+        if (controller != null && controller.isUsingPhysics()) {
+            float[] rootLocal = controller.getRootLinkLocalPosition(baseWorldPos);
+            if (rootLocal != null && rootLocal.length >= 3) {
+                return baseWorldPos.add(rootLocal[0], rootLocal[1], rootLocal[2]);
+            }
+        }
+        return baseWorldPos;
+    }
+
+    /**
+     * 월드 좌표 -> 카메라 상대 좌표(렌더 좌표)로 변환
+     */
+    private static Vector3f worldToCameraRelative(Vec3 worldPos) {
+        Minecraft mc = Minecraft.getInstance();
+        if (mc == null || mc.gameRenderer == null || mc.gameRenderer.getMainCamera() == null) {
+            return new Vector3f(); // fallback
+        }
+        Vec3 cam = mc.gameRenderer.getMainCamera().getPosition();
+        return new Vector3f(
+                (float) (worldPos.x - cam.x),
+                (float) (worldPos.y - cam.y),
+                (float) (worldPos.z - cam.z)
+        );
     }
 
     // ========================================================================
@@ -249,7 +317,10 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
     public void tickUpdate(float dt, Entity entity) {
         if (controller != null) {
             if (entity != null) {
-                controller.setWorldContext(entity.level(), entity.position());
+                Vec3 base = resolveRenderAnchorWorldPos(entity);
+                Vec3 rootWorld = computeRootWorldPos(base);
+                Vec3 ctxPos = USE_ROOT_WORLD_POS_FOR_WORLD_CONTEXT ? rootWorld : base;
+                controller.setWorldContext(entity.level(), ctxPos);
             }
             controller.update(dt);
         }
@@ -475,16 +546,18 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
 
         renderCount++;
 
+        if (renderCount % 120 == 1) {
+            logger.info("=== URDF RENDER #{} (Scale: {}, Physics: {}, AnchorLock: {}) ===",
+                    renderCount, GLOBAL_SCALE, isUsingPhysics(), LOCK_RENDER_ANCHOR_TO_FIRST_POSITION);
+        }
+
         // 컨트롤러에 월드 컨텍스트 전달 (블록 충돌/물리에서 사용)
         if (controller != null && entityIn != null) {
             Level level = entityIn.level();
-            Vec3 worldPos = entityIn.position();
-            controller.setWorldContext(level, worldPos);
-        }
-
-        if (renderCount % 120 == 1) {
-            logger.info("=== URDF RENDER #{} (Scale: {}, Physics: {}) ===",
-                    renderCount, GLOBAL_SCALE, isUsingPhysics());
+            Vec3 base = resolveRenderAnchorWorldPos(entityIn);
+            Vec3 rootWorld = computeRootWorldPos(base);
+            Vec3 ctxPos = USE_ROOT_WORLD_POS_FOR_WORLD_CONTEXT ? rootWorld : base;
+            controller.setWorldContext(level, ctxPos);
         }
 
         RenderSystem.enableBlend();
@@ -500,40 +573,21 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
             poseStack.pushPose();
 
             // ----------------------------------------------------------------
-            // rootOffset 계산 (entityTrans + (physics rootLocal))
+            // ✅ 핵심: 렌더 위치 계산
+            // - 기존: entityTrans 그대로 translate (스닉 renderOffset, 호스트 이동에 따라 끌려감)
+            // - 변경: (루트 월드좌표 - 카메라 월드좌표)로 직접 계산
+            //         + 앵커 고정이면 WASD로 플레이어 움직여도 로봇은 월드에 고정
             // ----------------------------------------------------------------
-            Vector3f rootOffset = entityTrans != null ? new Vector3f(entityTrans) : new Vector3f();
+            Vector3f rootOffset = new Vector3f();
 
-            // ✅ FIX: Shift(스닉) 시 entityTrans.y에 포함되는 "추가 다운 오프셋"만 제거
-            if (CANCEL_CROUCH_RENDER_OFFSET_Y && entityIn != null && entityTrans != null) {
-                boolean crouching = isCrouching(entityIn);
-
-                if (!crouching) {
-                    // 스닉이 아닐 때의 baseline 저장
-                    lastNonCrouchEntityTransY = entityTrans.y;
-                    hasLastNonCrouchEntityTransY = true;
-                } else if (hasLastNonCrouchEntityTransY) {
-                    // crouch 상태에서 현재 Y와 baseline의 차이(=crouch only delta)를 상쇄
-                    float crouchDeltaY = entityTrans.y - lastNonCrouchEntityTransY;
-
-                    // sanity check: 이상하게 큰 값이면 잘못된 상황일 수 있으니 무시
-                    if (Math.abs(crouchDeltaY) <= CROUCH_DELTA_SANITY_MAX) {
-                        rootOffset.y -= crouchDeltaY;
-                    } else if (DEBUG_MODE && renderCount < 10) {
-                        logger.debug("Skip crouch offset cancel: deltaY={} (baselineY={}, currentY={})",
-                                crouchDeltaY, lastNonCrouchEntityTransY, entityTrans.y);
-                    }
-                }
-            }
-
-            // physics root local offset 더하기
-            if (controller != null) {
-                if (controller.isUsingPhysics()) {
-                    Vec3 baseWorldPos = entityIn != null ? entityIn.position() : null;
-                    float[] rootLocal = controller.getRootLinkLocalPosition(baseWorldPos);
-                    if (rootLocal != null && rootLocal.length >= 3) {
-                        rootOffset.add(rootLocal[0], rootLocal[1], rootLocal[2]);
-                    }
+            if (USE_CAMERA_RELATIVE_TRANSLATION && entityIn != null) {
+                Vec3 baseWorld = resolveRenderAnchorWorldPos(entityIn);
+                Vec3 rootWorld = computeRootWorldPos(baseWorld);
+                rootOffset = worldToCameraRelative(rootWorld);
+            } else {
+                // fallback (특수 렌더 컨텍스트에서 카메라 접근이 안 되는 경우 등)
+                if (entityTrans != null) {
+                    rootOffset.set(entityTrans);
                 }
             }
 
@@ -700,7 +754,6 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
                     axis = new Vector3f(1, 0, 0);
                 } else {
                     axis = new Vector3f(joint.axis.xyz);
-                    // ✅ 오타 수정: lengthSquard() → lengthSquared()
                     if (axis.lengthSquared() < 1e-12f) axis.set(1, 0, 0);
                     else axis.normalize();
                 }
