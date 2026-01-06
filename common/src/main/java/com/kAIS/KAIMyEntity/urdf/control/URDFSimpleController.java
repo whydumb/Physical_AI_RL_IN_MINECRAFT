@@ -21,6 +21,15 @@ import java.util.*;
  * - ODE World = 마인크래프트 월드 좌표계
  * - 각 링크 Body = 월드 좌표에서의 위치/회전
  * - 위치 계산은 실시간으로 전달받은 엔티티 위치 기준
+ *
+ * =========================
+ * 수정(통째 리라이트) 핵심:
+ * 1) FIXED joint도 생성하도록 수정 (기존: isMovable()만 생성해서 FIXED가 아예 빠짐)
+ * 2) world(Null body)에 attach되는 joint는 기본 스킵 (URDF에 world->base fixed가 있으면 "절대 안 움직임" 방지)
+ *    - 필요하면 setAllowWorldAttachment(true)로 켤 수 있음
+ * 3) MESH geometry에서 collider type / mass 추정이 꼬이는 버그 수정 (sphere로 떨어지던 것 방지)
+ * 4) RL용 Physics-only 루트 API 제공: getRootBodyWorldPositionPhysicsOnly()
+ * 5) URDF mass override 시 inertia까지 함께 스케일되는 adjust() 우선 사용
  */
 public final class URDFSimpleController {
     private static final Logger logger = LogManager.getLogger();
@@ -78,6 +87,11 @@ public final class URDFSimpleController {
 
     // 물리 서브스텝 수
     private int physicsSubSteps = 4;
+
+    // ✅ NEW: world(null body)에 attach되는 조인트 생성 허용 여부
+    // - false(기본): world->base 같은 조인트가 있어도 로봇은 "자유 루트"로 둔다 (RL/물리에서 넘어질 수 있게)
+    // - true: URDF대로 world에 붙는 조인트도 만든다 (로봇 고정/힌지 고정이 필요할 때)
+    private boolean allowWorldAttachment = false;
 
     // ODE4J 버전
     private enum ODE4JVersion { V03X, V04X, V05X, UNKNOWN }
@@ -158,6 +172,7 @@ public final class URDFSimpleController {
                     logger.info("  ODE4J version: {}", odeVersion);
                     logger.info("  Bodies: {}, Geoms: {}, Joints: {}",
                             bodies.size(), geoms.size(), odeJoints.size());
+                    logger.info("  allowWorldAttachment: {}", allowWorldAttachment);
                     logger.info("  BlockCollisionManager: active");
 
                 } catch (Exception e) {
@@ -190,6 +205,25 @@ public final class URDFSimpleController {
                 logger.warn("Failed to apply physics tuning: {}", e.getMessage());
             }
         }
+    }
+
+    // ========================================================================
+    // NEW: 옵션/설정
+    // ========================================================================
+
+    /**
+     * URDF에 world(null body)로 attach되는 joint를 생성할지 여부.
+     * - false(기본): world attach joint는 스킵 => 로봇이 자유롭게 넘어질 수 있음(RL/물리 디폴트로 추천)
+     * - true: URDF대로 world attach joint도 생성 => 로봇이 고정될 수 있음(필요한 경우만)
+     *
+     * ⚠️ 주의: 이 값은 "물리 모델 build 전에" 설정하는 게 가장 안전함.
+     */
+    public void setAllowWorldAttachment(boolean allow) {
+        this.allowWorldAttachment = allow;
+    }
+
+    public boolean isAllowWorldAttachment() {
+        return allowWorldAttachment;
     }
 
     public void setSpawnCollisionMargin(double margin) {
@@ -326,11 +360,13 @@ public final class URDFSimpleController {
      * 바디를 평행이동(스폰 앵커)한 뒤 호출해야 함.
      */
     private void refreshHingeAnchors() {
-        if (physics == null) return;
+        if (physics == null || dHingeJointClass == null) return;
 
         try {
             Method setAnchor = dHingeJointClass.getMethod(
                     "setAnchor", double.class, double.class, double.class);
+
+            int refreshed = 0;
 
             for (URDFJoint j : joints.values()) {
                 if (j == null) continue;
@@ -341,6 +377,9 @@ public final class URDFSimpleController {
 
                 Object childBody  = bodies.get(j.childLinkName);
                 Object parentBody = bodies.get(j.parentLinkName);
+
+                // world attach joint는 기본 스킵
+                if (!allowWorldAttachment && (childBody == null || parentBody == null)) continue;
 
                 double ax = 0.0, ay = 0.0, az = 0.0;
                 boolean baseFromBody = false;
@@ -366,11 +405,11 @@ public final class URDFSimpleController {
                 }
 
                 setAnchor.invoke(odeJoint, ax, ay, az);
+                refreshed++;
             }
 
-            logger.info("Refreshed hinge anchors for {} joints", odeJoints.size());
+            logger.info("Refreshed hinge anchors for {} joints", refreshed);
         } catch (Exception e) {
-            // 메서드가 없거나 버전 차이인 경우 무시
             logger.debug("refreshHingeAnchors skipped: {}", e.getMessage());
         }
     }
@@ -390,8 +429,40 @@ public final class URDFSimpleController {
     }
 
     /**
+     * ✅ NEW: 물리 모드일 때만 "진짜" 루트 바디 월드 위치를 반환.
+     * - 물리 비활성/초기화 실패면 null 반환 (RL에서 fallback 좌표에 속지 않게 하려는 목적)
+     */
+    public double[] getRootBodyWorldPositionPhysicsOnly() {
+        if (!usePhysics || !physicsInitialized || bodies.isEmpty() || physics == null) {
+            return null;
+        }
+        Object root = getRootBody();
+        if (root == null) return null;
+
+        double[] pos = physics.getBodyPosition(root);
+        if (pos == null || pos.length < 3) return null;
+
+        if (!Double.isFinite(pos[0]) || !Double.isFinite(pos[1]) || !Double.isFinite(pos[2])) return null;
+        return new double[]{pos[0], pos[1], pos[2]};
+    }
+
+    /**
+     * ✅ NEW: physics-only 루트 쿼터니언 (w,x,y,z). 실패하면 null.
+     */
+    public float[] getRootBodyWorldQuaternionWXYZPhysicsOnly() {
+        if (!usePhysics || !physicsInitialized || bodies.isEmpty() || physics == null) {
+            return null;
+        }
+        Object root = getRootBody();
+        if (root == null) return null;
+
+        float[] q = tryReadBodyQuaternionWXYZ(root);
+        return q;
+    }
+
+    /**
      * ✅ NEW: 루트 바디의 월드 회전 쿼터니언 반환 (ODE 관례: w,x,y,z)
-     * 렌더러에서 roll/pitch까지 반영하기 위해 사용.
+     * 물리 비활성일 때는 identity 반환(기존 호환).
      */
     public float[] getRootBodyWorldQuaternionWXYZ() {
         if (!usePhysics || !physicsInitialized || bodies.isEmpty() || physics == null) {
@@ -513,7 +584,8 @@ public final class URDFSimpleController {
     }
 
     /**
-     * ✅ 루트 바디의 월드 위치 반환
+     * ✅ 기존 호환 유지: 물리 OFF여도 fallback 좌표 반환
+     * (단, RL 쪽에서는 getRootBodyWorldPositionPhysicsOnly()를 우선 쓰는 걸 추천)
      */
     public double[] getRootBodyWorldPosition() {
         if (!usePhysics || !physicsInitialized || bodies.isEmpty() || physics == null) {
@@ -590,7 +662,8 @@ public final class URDFSimpleController {
             Object odeJoint = entry.getValue();
             URDFJoint urdfJoint = joints.get(jointName);
 
-            if (urdfJoint == null || !urdfJoint.isMovable()) continue;
+            if (urdfJoint == null) continue;
+            if (!urdfJoint.isMovable()) continue; // 제어는 movable만
 
             float targetPos = target.getOrDefault(jointName, 0f);
             float targetVel = targetVelocities.getOrDefault(jointName, 0f);
@@ -622,12 +695,12 @@ public final class URDFSimpleController {
         odeCl = cl;
 
         // ✅ shaded math 패키지 로드 시도
-        try { 
-            dQuaternionClass = cl.loadClass("com.kAIS.ode4j.math.DQuaternion"); 
+        try {
+            dQuaternionClass = cl.loadClass("com.kAIS.ode4j.math.DQuaternion");
         } catch (Exception ignored) { }
-        
-        try { 
-            dMatrix3Class = cl.loadClass("com.kAIS.ode4j.math.DMatrix3"); 
+
+        try {
+            dMatrix3Class = cl.loadClass("com.kAIS.ode4j.math.DMatrix3");
         } catch (Exception ignored) { }
     }
 
@@ -693,9 +766,9 @@ public final class URDFSimpleController {
             }
         }
 
-        // 조인트 생성
+        // ✅ PATCH: 조인트 생성은 "모든 타입"을 고려 (FIXED 포함)
         for (URDFJoint joint : joints.values()) {
-            if (!joint.isMovable()) continue;
+            if (joint == null) continue;
 
             Object odeJoint = createODEJoint(joint, world);
             if (odeJoint != null) {
@@ -736,8 +809,12 @@ public final class URDFSimpleController {
                 case CYLINDER:
                     return Math.max(g.cylinderRadius, g.cylinderLength * 0.5f);
                 case MESH:
+                    // ✅ PATCH: 기존 0.1f는 너무 작아서 base height/clearance가 틀어질 수 있음
+                    // mesh scale을 "대략적인 크기"로 보고 radius 추정
                     if (g.scale != null) {
-                        return Math.max(g.scale.x, Math.max(g.scale.y, g.scale.z)) * 0.1f;
+                        float s = Math.max(g.scale.x, Math.max(g.scale.y, g.scale.z));
+                        s = Math.max(0.05f, Math.abs(s));
+                        return Math.max(0.08f, s * 0.25f);
                     }
                     break;
             }
@@ -842,6 +919,7 @@ public final class URDFSimpleController {
                     break;
 
                 default:
+                    // fallback
                     float radius = estimateLinkRadius(link);
                     geom = physics.createSphereGeom(radius * physicsScale);
                     break;
@@ -915,19 +993,32 @@ public final class URDFSimpleController {
                             geomInfo.radius = r;
                             geomInfo.height = h;
 
+                            // mass는 box로 근사
                             lx = ly = r * 2.0;
                             lz = h;
                         }
                         break;
 
                     case MESH:
+                        // ✅ PATCH: 기존은 lx/ly/lz만 바꾸고 geomInfo.type은 sphere로 남아서 collider가 sphere로 떨어짐
                         if (geom.scale != null) {
-                            double s = Math.max(
-                                    Math.max(Math.abs(geom.scale.x), Math.abs(geom.scale.y)),
-                                    Math.abs(geom.scale.z)
-                            );
+                            double sx = Math.abs(geom.scale.x);
+                            double sy = Math.abs(geom.scale.y);
+                            double sz = Math.abs(geom.scale.z);
+                            double s = Math.max(sx, Math.max(sy, sz));
                             s = Math.max(0.05, s);
-                            lx = ly = lz = s * 0.5;
+
+                            // mesh scale을 "대충 크기"로 보고 box collider로 맞춰준다
+                            double size = s * 0.5; // 휴리스틱
+
+                            geomInfo.type = "box";
+                            geomInfo.lx = size;
+                            geomInfo.ly = size;
+                            geomInfo.lz = size;
+
+                            lx = geomInfo.lx;
+                            ly = geomInfo.ly;
+                            lz = geomInfo.lz;
                         }
                         break;
                 }
@@ -941,12 +1032,15 @@ public final class URDFSimpleController {
                         lz * physicsScale);
             } else if (massSetSphereMethod != null) {
                 double r = Math.max(0.05, Math.max(lx, Math.max(ly, lz)) * 0.5);
+                geomInfo.type = "sphere";
+                geomInfo.radius = r;
                 massSetSphereMethod.invoke(mass, density, r * physicsScale);
             } else {
                 double fallbackMass = 1.0;
                 setMassValue(mass, fallbackMass);
             }
 
+            // URDF inertial mass가 있으면 override
             if (link != null && link.inertial != null && link.inertial.mass != null) {
                 float mv = link.inertial.mass.value;
                 if (mv > 0 && Float.isFinite(mv)) {
@@ -964,16 +1058,18 @@ public final class URDFSimpleController {
     }
 
     private void setMassValue(Object mass, double value) {
-        try {
-            Method setMass = dMassClass.getMethod("setMass", double.class);
-            setMass.invoke(mass, value);
-            return;
-        } catch (Exception e) { }
-
+        // ✅ PATCH: inertia까지 같이 스케일되는 adjust() 우선
         try {
             Method adjust = dMassClass.getMethod("adjust", double.class);
             adjust.invoke(mass, value);
-        } catch (Exception e) { }
+            return;
+        } catch (Exception ignored) { }
+
+        // fallback: setMass
+        try {
+            Method setMass = dMassClass.getMethod("setMass", double.class);
+            setMass.invoke(mass, value);
+        } catch (Exception ignored) { }
     }
 
     private void applyMassToBody(Object body, Object mass) throws Exception {
@@ -991,7 +1087,7 @@ public final class URDFSimpleController {
                     }
                 }
             }
-        } catch (Exception e) { }
+        } catch (Exception ignored) { }
 
         logger.warn("Could not apply mass to body");
     }
@@ -1004,6 +1100,11 @@ public final class URDFSimpleController {
         try {
             Object parentBody = bodies.get(joint.parentLinkName);
             Object childBody  = bodies.get(joint.childLinkName);
+
+            // ✅ PATCH: world attach (한쪽이 null) 조인트는 기본 스킵 (루트 자유)
+            if (!allowWorldAttachment && (parentBody == null || childBody == null)) {
+                return null;
+            }
 
             if (parentBody == null && childBody == null) {
                 return null;
@@ -1089,9 +1190,7 @@ public final class URDFSimpleController {
             }
 
             setAnchor.invoke(odeJoint, anchorX, anchorY, anchorZ);
-        } catch (Exception e) {
-            // ignore
-        }
+        } catch (Exception ignored) { }
 
         if (joint.type == URDFJoint.JointType.REVOLUTE &&
                 joint.limit != null && joint.limit.hasLimits()) {
@@ -1107,7 +1206,7 @@ public final class URDFSimpleController {
             Method setHi = dHingeJointClass.getMethod("setParamHiStop", double.class);
             setLo.invoke(odeJoint, (double) lower);
             setHi.invoke(odeJoint, (double) upper);
-        } catch (Exception e) { }
+        } catch (Exception ignored) { }
     }
 
     private Object createSliderJoint(URDFJoint joint, Object world,
@@ -1187,7 +1286,7 @@ public final class URDFSimpleController {
 
                 addSliderForce(odeJoint, force);
             }
-        } catch (Exception e) { }
+        } catch (Exception ignored) { }
     }
 
     private float getHingeAngle(Object joint) {
@@ -1212,7 +1311,7 @@ public final class URDFSimpleController {
         try {
             Method m = dHingeJointClass.getMethod("addTorque", double.class);
             m.invoke(joint, (double) torque);
-        } catch (Exception e) { }
+        } catch (Exception ignored) { }
     }
 
     private float getSliderPosition(Object joint) {
@@ -1237,7 +1336,7 @@ public final class URDFSimpleController {
         try {
             Method m = dSliderJointClass.getMethod("addForce", double.class);
             m.invoke(joint, (double) force);
-        } catch (Exception e) { }
+        } catch (Exception ignored) { }
     }
 
     private void syncJointStates() {
@@ -1265,6 +1364,7 @@ public final class URDFSimpleController {
 
     private void updateKinematic(float dt) {
         for (URDFJoint j : joints.values()) {
+            if (j == null) continue;
             if (!j.isMovable()) continue;
 
             float tgt = target.getOrDefault(j.name, j.currentPosition);
@@ -1329,7 +1429,6 @@ public final class URDFSimpleController {
                 String n = m.getName();
                 if (m.getParameterCount() != 1) continue;
 
-                // 가능한 이름들 (프로젝트마다 다를 수 있어서 넓게)
                 if (!(n.equals("getBodyQuaternion") || n.equals("getBodyQuat") || n.equals("getQuaternion"))) {
                     continue;
                 }
@@ -1348,17 +1447,14 @@ public final class URDFSimpleController {
             for (Method m : body.getClass().getMethods()) {
                 if (!m.getName().equals("getQuaternion")) continue;
 
-                // 1) getQuaternion() -> 반환형이 DQuaternionC 같은 경우
                 if (m.getParameterCount() == 0) {
                     Object ret = m.invoke(body);
                     float[] q = parseQuatWXYZ(ret);
                     if (q != null) return q;
                 }
 
-                // 2) getQuaternion(out) -> out을 우리가 만들어서 주입
                 if (m.getParameterCount() == 1) {
                     Class<?> pt = m.getParameterTypes()[0];
-
                     Object out = createQuaternionOut(pt);
                     if (out == null) continue;
 
@@ -1372,14 +1468,12 @@ public final class URDFSimpleController {
     }
 
     private Object createQuaternionOut(Class<?> expectedParamType) {
-        // (1) 파라미터 타입이 구체 클래스 + 기본생성자 있으면 그걸 생성
         try {
             if (!expectedParamType.isInterface()) {
                 return expectedParamType.getDeclaredConstructor().newInstance();
             }
         } catch (Exception ignored) { }
 
-        // (2) shaded DQuaternion을 알고 있으면 그걸 생성해서 "대입 가능"하면 사용
         try {
             if (dQuaternionClass != null && expectedParamType.isAssignableFrom(dQuaternionClass)) {
                 return dQuaternionClass.getDeclaredConstructor().newInstance();
@@ -1390,7 +1484,6 @@ public final class URDFSimpleController {
     }
 
     private float[] tryReadQuaternionFromRotation(Object body) {
-        // 1) body.getRotation() (0-arg)
         try {
             for (Method m : body.getClass().getMethods()) {
                 if (!m.getName().equals("getRotation")) continue;
@@ -1401,7 +1494,6 @@ public final class URDFSimpleController {
                     if (q != null) return q;
                 }
 
-                // 2) body.getRotation(out)
                 if (m.getParameterCount() == 1) {
                     Class<?> pt = m.getParameterTypes()[0];
                     Object out = createMatrix3Out(pt);
@@ -1414,7 +1506,6 @@ public final class URDFSimpleController {
             }
         } catch (Exception ignored) { }
 
-        // 2) PhysicsManager 쪽 getBodyRotation 류 (param 1/2 모두 허용하도록 개선)
         float[] q2 = tryReadRotationFromPhysicsManagerAnySignature(body);
         if (q2 != null) return q2;
 
@@ -1445,18 +1536,14 @@ public final class URDFSimpleController {
                 String ln = m.getName().toLowerCase(Locale.ROOT);
                 if (!ln.contains("rotation")) continue;
 
-                // (A) getBodyRotation(body) -> 반환
                 if (m.getParameterCount() == 1) {
                     Object ret = m.invoke(physics, body);
                     float[] q = parseRotationToQuatWXYZ(ret);
                     if (q != null) return q;
                 }
 
-                // (B) getBodyRotation(body, outArray) -> void
                 if (m.getParameterCount() == 2) {
-                    Class<?> p0 = m.getParameterTypes()[0];
                     Class<?> p1 = m.getParameterTypes()[1];
-                    if (!p0.isAssignableFrom(body.getClass()) && p0 != Object.class) continue;
 
                     if (p1 == double[].class) {
                         double[] out = new double[12];
@@ -1479,7 +1566,6 @@ public final class URDFSimpleController {
     private float[] parseQuatWXYZ(Object qObj) {
         if (qObj == null) return null;
 
-        // 배열 형태
         if (qObj instanceof double[]) {
             double[] a = (double[]) qObj;
             if (a.length >= 4) return normalizeQuatWXYZ((float)a[0], (float)a[1], (float)a[2], (float)a[3]);
@@ -1489,7 +1575,6 @@ public final class URDFSimpleController {
             if (a.length >= 4) return normalizeQuatWXYZ(a[0], a[1], a[2], a[3]);
         }
 
-        // ODE4J DQuaternion 계열: get0/get1/get2/get3 (w,x,y,z)
         try {
             Method g0 = qObj.getClass().getMethod("get0");
             Method g1 = qObj.getClass().getMethod("get1");
@@ -1502,7 +1587,6 @@ public final class URDFSimpleController {
             return normalizeQuatWXYZ(w, x, y, z);
         } catch (Exception ignored) { }
 
-        // 혹시 getW/getX/getY/getZ 형태
         try {
             Method gw = qObj.getClass().getMethod("getW");
             Method gx = qObj.getClass().getMethod("getX");
@@ -1521,7 +1605,6 @@ public final class URDFSimpleController {
     private float[] parseRotationToQuatWXYZ(Object rotObj) {
         if (rotObj == null) return null;
 
-        // ODE4J rotation matrix는 종종 double[12] (3x4, row stride 4) 형태
         if (rotObj instanceof double[]) {
             double[] r = (double[]) rotObj;
             if (r.length >= 12) {
@@ -1544,7 +1627,6 @@ public final class URDFSimpleController {
             }
         }
 
-        // float[] 형태도 지원
         if (rotObj instanceof float[]) {
             float[] r = (float[]) rotObj;
             if (r.length >= 12) {
@@ -1555,7 +1637,6 @@ public final class URDFSimpleController {
             }
         }
 
-        // DMatrix3 계열: get00/get01... 같은 accessor가 있을 수도 있음
         try {
             Method get00 = rotObj.getClass().getMethod("get00");
             Method get01 = rotObj.getClass().getMethod("get01");
@@ -1679,7 +1760,7 @@ public final class URDFSimpleController {
     public List<String> getMovableJointNames() {
         List<String> names = new ArrayList<>();
         for (URDFJoint j : joints.values()) {
-            if (j.isMovable()) names.add(j.name);
+            if (j != null && j.isMovable()) names.add(j.name);
         }
         return names;
     }
@@ -1705,7 +1786,7 @@ public final class URDFSimpleController {
     public Map<String, Float> getAllJointPositions() {
         Map<String, Float> positions = new HashMap<>();
         for (URDFJoint j : joints.values()) {
-            if (j.isMovable()) {
+            if (j != null && j.isMovable()) {
                 positions.put(j.name, j.currentPosition);
             }
         }
@@ -1809,6 +1890,7 @@ public final class URDFSimpleController {
 
     public void resetPhysics() {
         for (URDFJoint j : joints.values()) {
+            if (j == null) continue;
             j.currentPosition = 0f;
             j.currentVelocity = 0f;
             target.put(j.name, 0f);
