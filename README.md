@@ -1,7 +1,7 @@
 ![강화학습](https://github.com/user-attachments/assets/be09f9b2-345e-46be-9057-657383ffb9ac)# Physical AI RL IN  Minecraft
 
 
-
+흠
 마인크래프트를 통해 피지컬 AI 강화학습을 쉽게 접하고 즐길 수 있는 프로젝트입니다.
 
 ## Overview
